@@ -1,0 +1,88 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+local/.venv/
+
+# ==============================
+# Dataset / raw media
+# ==============================
+dataset/
+datasets/
+data/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ==============================
+# Local runtime cache
+# ==============================
+.tts_cache/
+local/.tts_cache/
+*.mp3
+*.wav
+
+# ==============================
+# Trained model checkpoints
+# Keep small config / mean / std / metrics if desired,
+# but do not commit large model weights directly.
+# ==============================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Kaggle / training working outputs
+wl_bisindo_hand134_transformer_v4/
+outputs/
+output/
+checkpoints/
+
+# ==============================
+# Notebook / Python caches
+# ==============================
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==============================
+# IDE / OS
+# ==============================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# Archives / temporary files
+# ==============================
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tmp
+*.temp
+*.log
+
+# ==============================
+# Secrets / environment files
+# ==============================
+.env
+.env.*
+!.env.example
+*.pem
+*.key

@@ -1,0 +1,13 @@
+{
+  "model": "DualHandTemporalTransformer",
+  "seq_len": 48,
+  "feature_dim": 134,
+  "num_classes": 32,
+  "test_signer": 4,
+  "development_split_mode": "leave-one-development-signer-out",
+  "development_validation_signer": 1,
+  "best_epoch": 18,
+  "test_accuracy": 0.865625,
+  "test_macro_f1": 0.85725311145085,
+  "zero_f1_classes": []
+}

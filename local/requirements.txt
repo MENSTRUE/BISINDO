@@ -1,0 +1,8 @@
+# Recommended: Python 3.11.x
+# Training notebook uses PyTorch 2.10.0.
+numpy==1.26.4
+opencv-contrib-python==4.10.0.84
+mediapipe==0.10.21
+torch==2.10.0
+edge-tts>=7.0.0
+pygame>=2.5.2

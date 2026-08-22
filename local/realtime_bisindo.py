@@ -1,0 +1,2384 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+WL-BISINDO Hand134 Transformer V4
+Fast Continuous Local Realtime + Indonesian Neural TTS
+
+Runtime pipeline:
+Webcam / video
+  -> MediaPipe Pose (helper only)
+  -> MediaPipe Hands
+  -> anatomical left/right assignment
+  -> ROI recovery for missing hand
+  -> rolling 48-frame raw landmark window
+  -> short-gap interpolation + EMA smoothing
+  -> Hand134 features (48 x 134)
+  -> same feature_mean / feature_std normalization as training
+  -> TorchScript Hand134 Transformer
+  -> confidence + top1/top2 margin + temporal voting
+  -> text
+  -> Indonesian Edge Neural TTS
+
+Important:
+- NO hand_disappeared requirement.
+- The rolling sequence is NOT cleared after a word is accepted.
+- A different next gesture can be recognized while hands remain visible.
+- The same held gesture is emitted only once until a real transition occurs.
+- Low-confidence raw classes are hidden from the main UI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import queue
+import threading
+import time
+from collections import Counter, deque
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+# Prevent MediaPipe from trying optional TensorFlow paths in some installs.
+import sys
+sys.modules.setdefault("tensorflow", None)
+
+import mediapipe as mp
+
+
+# ============================================================
+# Paths
+# ============================================================
+
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_DIR = APP_DIR / "model"
+
+DEFAULT_MODEL_PATH = (
+    DEFAULT_MODEL_DIR / "wl_bisindo_hand134_transformer_traced.pt"
+)
+DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / "feature_mean.npy"
+DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / "feature_std.npy"
+DEFAULT_MAPPING_PATH = DEFAULT_MODEL_DIR / "class_mapping.json"
+
+
+# ============================================================
+# Preprocessing V2 constants — MUST match Kaggle preprocessing
+# ============================================================
+
+SEQ_LEN = 48
+NUM_HANDS = 2
+NUM_HAND_LANDMARKS = 21
+
+HAND_FEATURES = 67
+FEATURE_DIM = 134
+NUM_CLASSES = 32
+
+LEFT = 0
+RIGHT = 1
+
+LEFT_PRESENCE_IDX = 66
+RIGHT_PRESENCE_IDX = 133
+
+# Recovery / smoothing.
+MAX_INTERP_GAP = 6
+EDGE_FILL = 2
+EMA_ALPHA = 0.65
+
+# Pose quality.
+POSE_VIS_THRESHOLD = 0.25
+
+# Hand detector.
+FULL_HAND_DET_CONF = 0.30
+FULL_HAND_TRACK_CONF = 0.30
+RECOVERY_DET_CONF = 0.20
+
+
+# ============================================================
+# Small helpers
+# ============================================================
+
+def select_device(force_cpu: bool = False) -> torch.device:
+    if force_cpu:
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def load_mapping(path: Path) -> dict[int, str]:
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    mapping = {int(k): str(v) for k, v in raw.items()}
+
+    if len(mapping) != NUM_CLASSES:
+        raise ValueError(
+            f"class_mapping harus {NUM_CLASSES} kelas, "
+            f"found {len(mapping)}"
+        )
+
+    return mapping
+
+
+def load_runtime_files(
+    model_path: Path,
+    mean_path: Path,
+    std_path: Path,
+    mapping_path: Path,
+    device: torch.device,
+):
+    required = [
+        model_path,
+        mean_path,
+        std_path,
+        mapping_path,
+    ]
+
+    missing = [p for p in required if not p.exists()]
+    if missing:
+        lines = "\n".join(f" - {p}" for p in missing)
+        raise FileNotFoundError(
+            "File runtime belum lengkap:\n"
+            f"{lines}\n\n"
+            "Copy hasil export Kaggle ke folder local/model/."
+        )
+
+    feature_mean = np.load(mean_path).astype(np.float32)
+    feature_std = np.load(std_path).astype(np.float32)
+
+    if feature_mean.shape != (FEATURE_DIM,):
+        raise ValueError(
+            f"feature_mean harus ({FEATURE_DIM},), "
+            f"found {feature_mean.shape}"
+        )
+
+    if feature_std.shape != (FEATURE_DIM,):
+        raise ValueError(
+            f"feature_std harus ({FEATURE_DIM},), "
+            f"found {feature_std.shape}"
+        )
+
+    feature_std = np.where(
+        feature_std < 1e-5,
+        1.0,
+        feature_std,
+    ).astype(np.float32)
+
+    mapping = load_mapping(mapping_path)
+
+    model = torch.jit.load(
+        str(model_path),
+        map_location=device,
+    ).eval()
+
+    # One real shape sanity check.
+    dummy = torch.zeros(
+        1,
+        SEQ_LEN,
+        FEATURE_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    with torch.inference_mode():
+        output = model(dummy)
+
+    if tuple(output.shape) != (1, NUM_CLASSES):
+        raise RuntimeError(
+            "Output model tidak sesuai. "
+            f"Expected (1,{NUM_CLASSES}), found {tuple(output.shape)}"
+        )
+
+    return model, feature_mean, feature_std, mapping
+
+
+def landmark_list_to_array(hand_landmarks) -> np.ndarray:
+    return np.asarray(
+        [
+            [lm.x, lm.y, lm.z]
+            for lm in hand_landmarks.landmark
+        ],
+        dtype=np.float32,
+    )
+
+
+# ============================================================
+# Preprocessing V2: pose anchor
+# ============================================================
+
+def pose_anchor(pose_result):
+    body_center = np.array(
+        [0.5, 0.5, 0.0],
+        dtype=np.float32,
+    )
+    body_scale = 0.35
+
+    left_wrist = None
+    right_wrist = None
+    valid = 0.0
+
+    if pose_result.pose_landmarks is None:
+        return (
+            body_center,
+            body_scale,
+            left_wrist,
+            right_wrist,
+            valid,
+        )
+
+    lms = pose_result.pose_landmarks.landmark
+
+    left_shoulder = np.array(
+        [lms[11].x, lms[11].y, lms[11].z],
+        dtype=np.float32,
+    )
+
+    right_shoulder = np.array(
+        [lms[12].x, lms[12].y, lms[12].z],
+        dtype=np.float32,
+    )
+
+    body_center = (
+        left_shoulder + right_shoulder
+    ) / 2.0
+
+    body_scale = float(
+        max(
+            np.linalg.norm(
+                left_shoulder[:2] - right_shoulder[:2]
+            ),
+            0.08,
+        )
+    )
+
+    if lms[15].visibility >= POSE_VIS_THRESHOLD:
+        left_wrist = np.array(
+            [lms[15].x, lms[15].y, lms[15].z],
+            dtype=np.float32,
+        )
+
+    if lms[16].visibility >= POSE_VIS_THRESHOLD:
+        right_wrist = np.array(
+            [lms[16].x, lms[16].y, lms[16].z],
+            dtype=np.float32,
+        )
+
+    valid = 1.0
+
+    return (
+        body_center,
+        body_scale,
+        left_wrist,
+        right_wrist,
+        valid,
+    )
+
+
+# ============================================================
+# Preprocessing V2: hand candidates + anatomical assignment
+# ============================================================
+
+def collect_full_hand_candidates(hand_result):
+    candidates = []
+
+    if hand_result.multi_hand_landmarks is None:
+        return candidates
+
+    handedness_list = hand_result.multi_handedness or []
+
+    for i, landmarks in enumerate(
+        hand_result.multi_hand_landmarks
+    ):
+        arr = landmark_list_to_array(landmarks)
+
+        handedness_label = None
+        handedness_score = 0.0
+
+        if i < len(handedness_list):
+            cls = handedness_list[i].classification[0]
+            handedness_label = cls.label
+            handedness_score = float(cls.score)
+
+        candidates.append(
+            {
+                "arr": arr,
+                "wrist": arr[0],
+                "handedness_label": handedness_label,
+                "handedness_score": handedness_score,
+            }
+        )
+
+    return candidates
+
+
+def xy_distance(a, b) -> float:
+    return float(
+        np.linalg.norm(
+            a[:2] - b[:2]
+        )
+    )
+
+
+def assign_candidates_to_body_sides(
+    candidates,
+    left_pose_wrist,
+    right_pose_wrist,
+    prev_left_wrist,
+    prev_right_wrist,
+):
+    assigned = {
+        LEFT: None,
+        RIGHT: None,
+    }
+
+    if len(candidates) == 0:
+        return assigned
+
+    anchors = {
+        LEFT: (
+            left_pose_wrist
+            if left_pose_wrist is not None
+            else prev_left_wrist
+        ),
+        RIGHT: (
+            right_pose_wrist
+            if right_pose_wrist is not None
+            else prev_right_wrist
+        ),
+    }
+
+    if len(candidates) == 1:
+        cand = candidates[0]
+        costs = {}
+
+        for side in [LEFT, RIGHT]:
+            anchor = anchors[side]
+            if anchor is not None:
+                costs[side] = xy_distance(
+                    cand["wrist"],
+                    anchor,
+                )
+
+        if costs:
+            chosen_side = min(
+                costs,
+                key=costs.get,
+            )
+            assigned[chosen_side] = cand["arr"]
+            return assigned
+
+        # Same fallback convention as preprocessing V2.
+        # Dataset input is not mirrored, so MediaPipe label is flipped.
+        label = cand["handedness_label"]
+
+        if label == "Left":
+            assigned[RIGHT] = cand["arr"]
+        elif label == "Right":
+            assigned[LEFT] = cand["arr"]
+        else:
+            assigned[LEFT] = cand["arr"]
+
+        return assigned
+
+    candidates = candidates[:2]
+
+    c0 = candidates[0]
+    c1 = candidates[1]
+
+    if (
+        anchors[LEFT] is not None
+        and anchors[RIGHT] is not None
+    ):
+        cost_a = (
+            xy_distance(
+                c0["wrist"],
+                anchors[LEFT],
+            )
+            + xy_distance(
+                c1["wrist"],
+                anchors[RIGHT],
+            )
+        )
+
+        cost_b = (
+            xy_distance(
+                c0["wrist"],
+                anchors[RIGHT],
+            )
+            + xy_distance(
+                c1["wrist"],
+                anchors[LEFT],
+            )
+        )
+
+        if cost_a <= cost_b:
+            assigned[LEFT] = c0["arr"]
+            assigned[RIGHT] = c1["arr"]
+        else:
+            assigned[LEFT] = c1["arr"]
+            assigned[RIGHT] = c0["arr"]
+
+        return assigned
+
+    remaining = [0, 1]
+
+    for side in [LEFT, RIGHT]:
+        anchor = anchors[side]
+
+        if anchor is None or not remaining:
+            continue
+
+        best_idx = min(
+            remaining,
+            key=lambda j: xy_distance(
+                candidates[j]["wrist"],
+                anchor,
+            ),
+        )
+
+        assigned[side] = candidates[best_idx]["arr"]
+        remaining.remove(best_idx)
+
+    if remaining:
+        if assigned[LEFT] is None:
+            assigned[LEFT] = candidates[
+                remaining[0]
+            ]["arr"]
+        elif assigned[RIGHT] is None:
+            assigned[RIGHT] = candidates[
+                remaining[0]
+            ]["arr"]
+
+    return assigned
+
+
+# ============================================================
+# Preprocessing V2: ROI recovery
+# ============================================================
+
+def make_wrist_roi(
+    frame,
+    target_wrist,
+    body_scale,
+):
+    if target_wrist is None:
+        return None
+
+    h, w = frame.shape[:2]
+
+    cx = int(
+        np.clip(
+            target_wrist[0],
+            0.0,
+            1.0,
+        )
+        * w
+    )
+
+    cy = int(
+        np.clip(
+            target_wrist[1],
+            0.0,
+            1.0,
+        )
+        * h
+    )
+
+    shoulder_px = (
+        body_scale
+        * max(w, h)
+    )
+
+    half = int(
+        np.clip(
+            1.10 * shoulder_px,
+            72,
+            0.30 * max(w, h),
+        )
+    )
+
+    x0 = max(0, cx - half)
+    y0 = max(0, cy - half)
+    x1 = min(w, cx + half)
+    y1 = min(h, cy + half)
+
+    if x1 - x0 < 48 or y1 - y0 < 48:
+        return None
+
+    crop = frame[y0:y1, x0:x1]
+
+    return (
+        crop,
+        x0,
+        y0,
+        x1,
+        y1,
+    )
+
+
+def map_crop_hand_to_full(
+    crop_hand_landmarks,
+    x0,
+    y0,
+    x1,
+    y1,
+    full_w,
+    full_h,
+):
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+
+    arr = np.zeros(
+        (
+            NUM_HAND_LANDMARKS,
+            3,
+        ),
+        dtype=np.float32,
+    )
+
+    for i, lm in enumerate(
+        crop_hand_landmarks.landmark
+    ):
+        arr[i, 0] = (
+            x0 + lm.x * crop_w
+        ) / full_w
+
+        arr[i, 1] = (
+            y0 + lm.y * crop_h
+        ) / full_h
+
+        arr[i, 2] = (
+            lm.z * crop_w / full_w
+        )
+
+    return arr
+
+
+def recover_hand_from_roi(
+    frame,
+    target_wrist,
+    body_scale,
+    recovery_hands,
+):
+    roi = make_wrist_roi(
+        frame,
+        target_wrist,
+        body_scale,
+    )
+
+    if roi is None:
+        return None
+
+    (
+        crop,
+        x0,
+        y0,
+        x1,
+        y1,
+    ) = roi
+
+    crop_rgb = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2RGB,
+    )
+
+    result = recovery_hands.process(
+        crop_rgb
+    )
+
+    if (
+        result.multi_hand_landmarks is None
+        or len(
+            result.multi_hand_landmarks
+        ) == 0
+    ):
+        return None
+
+    full_h, full_w = frame.shape[:2]
+
+    arrays = []
+
+    for landmarks in (
+        result.multi_hand_landmarks
+    ):
+        arr = map_crop_hand_to_full(
+            landmarks,
+            x0,
+            y0,
+            x1,
+            y1,
+            full_w,
+            full_h,
+        )
+        arrays.append(arr)
+
+    return min(
+        arrays,
+        key=lambda arr: xy_distance(
+            arr[0],
+            target_wrist,
+        ),
+    )
+
+
+# ============================================================
+# Preprocessing V2: temporal recovery + smoothing
+# ============================================================
+
+def interpolate_short_gaps(
+    track,
+    max_gap=MAX_INTERP_GAP,
+    edge_fill=EDGE_FILL,
+):
+    out = track.copy()
+
+    valid = np.isfinite(
+        out
+    ).all(
+        axis=(1, 2)
+    )
+
+    valid_idx = np.where(
+        valid
+    )[0]
+
+    if len(valid_idx) == 0:
+        return out, valid.copy()
+
+    for a, b in zip(
+        valid_idx[:-1],
+        valid_idx[1:],
+    ):
+        gap = b - a - 1
+
+        if (
+            gap <= 0
+            or gap > max_gap
+        ):
+            continue
+
+        start = out[a]
+        end = out[b]
+
+        for k in range(
+            1,
+            gap + 1,
+        ):
+            ratio = (
+                k / (gap + 1)
+            )
+
+            out[a + k] = (
+                (1.0 - ratio) * start
+                + ratio * end
+            )
+
+    first = int(valid_idx[0])
+    last = int(valid_idx[-1])
+
+    for t in range(
+        max(0, first - edge_fill),
+        first,
+    ):
+        out[t] = out[first]
+
+    for t in range(
+        last + 1,
+        min(
+            len(out),
+            last + edge_fill + 1,
+        ),
+    ):
+        out[t] = out[last]
+
+    new_valid = np.isfinite(
+        out
+    ).all(
+        axis=(1, 2)
+    )
+
+    return out, new_valid
+
+
+def ema_smooth_track(
+    track,
+    valid_mask,
+    alpha=EMA_ALPHA,
+):
+    out = track.copy()
+    prev = None
+
+    for t in range(len(out)):
+        if not valid_mask[t]:
+            prev = None
+            continue
+
+        if prev is None:
+            prev = out[t].copy()
+        else:
+            prev = (
+                alpha * out[t]
+                + (1.0 - alpha) * prev
+            )
+            out[t] = prev
+
+    return out
+
+
+def fill_pose_anchors(
+    centers,
+    scales,
+    valid,
+):
+    out_centers = centers.copy()
+    out_scales = scales.copy()
+
+    valid_idx = np.where(
+        valid > 0.5
+    )[0]
+
+    if len(valid_idx) == 0:
+        out_centers[:] = np.array(
+            [0.5, 0.5, 0.0],
+            dtype=np.float32,
+        )
+        out_scales[:] = 0.35
+        return out_centers, out_scales
+
+    timeline = np.arange(
+        len(valid)
+    )
+
+    for d in range(3):
+        out_centers[:, d] = np.interp(
+            timeline,
+            valid_idx,
+            centers[
+                valid_idx,
+                d,
+            ],
+        )
+
+    out_scales[:] = np.interp(
+        timeline,
+        valid_idx,
+        scales[valid_idx],
+    )
+
+    return out_centers, out_scales
+
+
+# ============================================================
+# Preprocessing V2: Hand134
+# ============================================================
+
+def hand_to_feature(
+    hand_arr,
+    body_center,
+    body_scale,
+    valid,
+):
+    feat = np.zeros(
+        HAND_FEATURES,
+        dtype=np.float32,
+    )
+
+    if not valid:
+        return feat
+
+    wrist = hand_arr[0].copy()
+
+    local = (
+        hand_arr - wrist
+    )
+
+    hand_scale = float(
+        max(
+            np.linalg.norm(
+                hand_arr[9, :2]
+                - hand_arr[0, :2]
+            ),
+            np.linalg.norm(
+                hand_arr[5, :2]
+                - hand_arr[17, :2]
+            ),
+            np.linalg.norm(
+                hand_arr[12, :2]
+                - hand_arr[0, :2]
+            ),
+            0.025,
+        )
+    )
+
+    local = (
+        local / hand_scale
+    )
+
+    wrist_global = (
+        wrist - body_center
+    ) / max(
+        body_scale,
+        0.08,
+    )
+
+    feat[:63] = local.reshape(-1)
+    feat[63:66] = wrist_global
+    feat[66] = 1.0
+
+    feat[:66] = np.clip(
+        feat[:66],
+        -10.0,
+        10.0,
+    )
+
+    return feat
+
+
+@dataclass
+class FrameState:
+    tracks: np.ndarray       # [2,21,3], NaN for missing
+    observed: np.ndarray     # [2]
+    body_center: np.ndarray  # [3]
+    body_scale: float
+    pose_valid: int
+
+
+def build_hand134_sequence(
+    states,
+    feature_mean,
+    feature_std,
+):
+    if len(states) < SEQ_LEN:
+        return None, None
+
+    states = list(states)[-SEQ_LEN:]
+
+    tracks = np.stack(
+        [s.tracks for s in states],
+        axis=0,
+    ).astype(np.float32)
+
+    observed = np.stack(
+        [s.observed for s in states],
+        axis=0,
+    ).astype(np.uint8)
+
+    body_centers = np.stack(
+        [s.body_center for s in states],
+        axis=0,
+    ).astype(np.float32)
+
+    body_scales = np.asarray(
+        [s.body_scale for s in states],
+        dtype=np.float32,
+    )
+
+    pose_valid = np.asarray(
+        [s.pose_valid for s in states],
+        dtype=np.uint8,
+    )
+
+    (
+        body_centers,
+        body_scales,
+    ) = fill_pose_anchors(
+        body_centers,
+        body_scales,
+        pose_valid,
+    )
+
+    final_valid = np.zeros(
+        (
+            SEQ_LEN,
+            NUM_HANDS,
+        ),
+        dtype=np.uint8,
+    )
+
+    for side in [LEFT, RIGHT]:
+        track = tracks[:, side]
+
+        (
+            track,
+            valid_mask,
+        ) = interpolate_short_gaps(
+            track
+        )
+
+        track = ema_smooth_track(
+            track,
+            valid_mask,
+        )
+
+        tracks[:, side] = track
+
+        final_valid[:, side] = (
+            valid_mask.astype(
+                np.uint8
+            )
+        )
+
+    sequence = np.zeros(
+        (
+            SEQ_LEN,
+            FEATURE_DIM,
+        ),
+        dtype=np.float32,
+    )
+
+    for t in range(SEQ_LEN):
+        left_feat = hand_to_feature(
+            tracks[t, LEFT],
+            body_centers[t],
+            body_scales[t],
+            bool(
+                final_valid[t, LEFT]
+            ),
+        )
+
+        right_feat = hand_to_feature(
+            tracks[t, RIGHT],
+            body_centers[t],
+            body_scales[t],
+            bool(
+                final_valid[t, RIGHT]
+            ),
+        )
+
+        sequence[t] = np.concatenate(
+            [
+                left_feat,
+                right_feat,
+            ]
+        ).astype(np.float32)
+
+    # EXACT runtime normalization logic used by final training.
+    left_presence = sequence[
+        :,
+        LEFT_PRESENCE_IDX,
+    ].copy()
+
+    right_presence = sequence[
+        :,
+        RIGHT_PRESENCE_IDX,
+    ].copy()
+
+    x = (
+        sequence - feature_mean
+    ) / feature_std
+
+    left_absent = (
+        left_presence < 0.5
+    )
+    right_absent = (
+        right_presence < 0.5
+    )
+
+    x[
+        left_absent,
+        0:66,
+    ] = 0.0
+
+    x[
+        right_absent,
+        67:133,
+    ] = 0.0
+
+    x[
+        :,
+        LEFT_PRESENCE_IDX,
+    ] = left_presence
+
+    x[
+        :,
+        RIGHT_PRESENCE_IDX,
+    ] = right_presence
+
+    x = x.astype(
+        np.float32
+    )
+
+    quality = {
+        "observed_any": float(
+            (
+                observed.sum(axis=1)
+                > 0
+            ).mean()
+        ),
+        "valid_any": float(
+            (
+                final_valid.sum(axis=1)
+                > 0
+            ).mean()
+        ),
+        "left_valid": float(
+            final_valid[:, LEFT].mean()
+        ),
+        "right_valid": float(
+            final_valid[:, RIGHT].mean()
+        ),
+    }
+
+    return x, quality
+
+
+# ============================================================
+# Model inference
+# ============================================================
+
+@torch.inference_mode()
+def predict_sequence(
+    model,
+    sequence,
+    device,
+):
+    x = torch.from_numpy(
+        sequence
+    ).unsqueeze(0).to(
+        device,
+        non_blocking=True,
+    )
+
+    logits = model(x)
+
+    probs = torch.softmax(
+        logits,
+        dim=1,
+    )[0]
+
+    top_k = min(
+        2,
+        probs.numel(),
+    )
+
+    values, indices = torch.topk(
+        probs,
+        k=top_k,
+    )
+
+    pred_id = int(
+        indices[0].item()
+    )
+    confidence = float(
+        values[0].item()
+    )
+
+    second = (
+        float(values[1].item())
+        if top_k > 1
+        else 0.0
+    )
+
+    margin = (
+        confidence - second
+    )
+
+    return (
+        pred_id,
+        confidence,
+        margin,
+    )
+
+
+# ============================================================
+# Indonesian Neural TTS
+# ============================================================
+
+class IndonesianTTS:
+    def __init__(
+        self,
+        enabled=True,
+        voice="id-ID-ArdiNeural",
+        cache_dir=None,
+    ):
+        self.enabled = bool(enabled)
+        self.voice = str(voice)
+
+        if cache_dir is None:
+            cache_dir = APP_DIR / ".tts_cache"
+
+        self.cache_dir = Path(
+            cache_dir
+        )
+        self.cache_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # Only keep the newest pending utterance.
+        # This prevents a backlog such as "Maaf, Maaf, Maaf"
+        # from continuing to play after the visual prediction changed.
+        self._queue = queue.Queue(
+            maxsize=1
+        )
+        self._stop = threading.Event()
+
+        self._last_enqueued_text = None
+        self._last_enqueued_at = 0.0
+
+        self._edge_tts = None
+        self._pygame = None
+        self._ready = False
+
+        if not self.enabled:
+            print("[TTS] OFF")
+            return
+
+        try:
+            import edge_tts
+            import pygame
+
+            self._edge_tts = edge_tts
+            self._pygame = pygame
+
+            pygame.mixer.init()
+
+            self._ready = True
+
+            print(
+                "[TTS] Indonesian Neural Voice:",
+                self.voice,
+            )
+
+            self._thread = threading.Thread(
+                target=self._worker,
+                daemon=True,
+            )
+            self._thread.start()
+
+        except Exception as exc:
+            self._ready = False
+            print(
+                "[WARN] TTS tidak aktif:",
+                exc,
+            )
+            print(
+                "[INFO] Recognition tetap berjalan. "
+                "TTS memerlukan edge-tts + pygame."
+            )
+
+    @property
+    def ready(self):
+        return (
+            self.enabled
+            and self._ready
+        )
+
+    def toggle(self):
+        self.enabled = (
+            not self.enabled
+        )
+        print(
+            "[TTS]",
+            "ON" if self.enabled else "OFF",
+        )
+
+    def _cache_file(
+        self,
+        text,
+    ):
+        key = hashlib.sha1(
+            (
+                self.voice
+                + "|"
+                + text
+            ).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
+
+        return (
+            self.cache_dir
+            / f"{key}.mp3"
+        )
+
+    async def _generate(
+        self,
+        text,
+        path,
+    ):
+        communicator = (
+            self._edge_tts.Communicate(
+                text=text,
+                voice=self.voice,
+                rate="+0%",
+                volume="+0%",
+                pitch="+0Hz",
+            )
+        )
+
+        await communicator.save(
+            str(path)
+        )
+
+    def _play(
+        self,
+        path,
+    ):
+        self._pygame.mixer.music.load(
+            str(path)
+        )
+        self._pygame.mixer.music.play()
+
+        while (
+            self._pygame.mixer.music
+            .get_busy()
+        ):
+            if self._stop.is_set():
+                break
+
+            time.sleep(
+                0.02
+            )
+
+    def _worker(self):
+        while not self._stop.is_set():
+            try:
+                text = self._queue.get(
+                    timeout=0.2
+                )
+            except queue.Empty:
+                continue
+
+            try:
+                path = self._cache_file(
+                    text
+                )
+
+                if not path.exists():
+                    asyncio.run(
+                        self._generate(
+                            text,
+                            path,
+                        )
+                    )
+
+                if path.exists():
+                    self._play(
+                        path
+                    )
+
+            except Exception as exc:
+                print(
+                    f"[WARN] TTS gagal '{text}':",
+                    exc,
+                )
+
+            finally:
+                self._queue.task_done()
+
+    def speak(
+        self,
+        text,
+    ):
+        if not self.ready:
+            return
+
+        text = str(
+            text
+        ).strip()
+
+        if not text:
+            return
+
+        now = time.monotonic()
+
+        # Extra TTS-level duplicate guard.
+        # Recognition already has a stronger event gate, but this
+        # prevents accidental duplicate queueing as a second safety net.
+        if (
+            text == self._last_enqueued_text
+            and now - self._last_enqueued_at < 1.25
+        ):
+            return
+
+        self._last_enqueued_text = text
+        self._last_enqueued_at = now
+
+        # Drop stale pending speech and keep only the newest one.
+        try:
+            while True:
+                self._queue.get_nowait()
+                self._queue.task_done()
+        except queue.Empty:
+            pass
+
+        try:
+            self._queue.put_nowait(
+                text
+            )
+        except queue.Full:
+            pass
+
+    def close(self):
+        self._stop.set()
+
+        try:
+            if self._pygame is not None:
+                self._pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Display helpers
+# ============================================================
+
+def draw_hand_points(
+    frame,
+    hand_arr,
+    color,
+):
+    if hand_arr is None:
+        return
+
+    if not np.isfinite(
+        hand_arr
+    ).all():
+        return
+
+    h, w = frame.shape[:2]
+
+    for p in hand_arr:
+        x = int(
+            np.clip(
+                p[0],
+                0.0,
+                1.0,
+            )
+            * w
+        )
+        y = int(
+            np.clip(
+                p[1],
+                0.0,
+                1.0,
+            )
+            * h
+        )
+
+        cv2.circle(
+            frame,
+            (x, y),
+            2,
+            color,
+            -1,
+            cv2.LINE_AA,
+        )
+
+
+def put_line(
+    frame,
+    text,
+    y,
+    scale=0.55,
+    thickness=1,
+    x=20,
+):
+    cv2.putText(
+        frame,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_translucent_panel(
+    frame,
+    x0,
+    y0,
+    x1,
+    y1,
+    alpha=0.58,
+):
+    overlay = frame.copy()
+
+    cv2.rectangle(
+        overlay,
+        (x0, y0),
+        (x1, y1),
+        (0, 0, 0),
+        -1,
+    )
+
+    cv2.addWeighted(
+        overlay,
+        alpha,
+        frame,
+        1.0 - alpha,
+        0,
+        frame,
+    )
+
+
+# ============================================================
+# Main realtime
+# ============================================================
+
+def run(args):
+    device = select_device(
+        force_cpu=args.cpu
+    )
+
+    model_path = Path(
+        args.model
+    )
+    mean_path = Path(
+        args.mean
+    )
+    std_path = Path(
+        args.std
+    )
+    mapping_path = Path(
+        args.mapping
+    )
+
+    (
+        model,
+        feature_mean,
+        feature_std,
+        labels,
+    ) = load_runtime_files(
+        model_path,
+        mean_path,
+        std_path,
+        mapping_path,
+        device,
+    )
+
+    print("=" * 72)
+    print(
+        "WL-BISINDO HAND134 TRANSFORMER V4 — FAST CONTINUOUS"
+    )
+    print("=" * 72)
+    print(
+        "Device         :",
+        device,
+    )
+
+    if device.type == "cuda":
+        print(
+            "GPU            :",
+            torch.cuda.get_device_name(
+                0
+            ),
+        )
+
+    print(
+        "Input model    :",
+        f"{SEQ_LEN} x {FEATURE_DIM}",
+    )
+    print(
+        "Threshold      :",
+        args.threshold,
+    )
+    print(
+        "Margin         :",
+        args.min_margin,
+    )
+    print(
+        "Vote           :",
+        f"{args.vote_hits}/{args.vote_window}",
+    )
+    print(
+        "Infer every    :",
+        args.infer_every,
+        "frame",
+    )
+    print(
+        "IMPORTANT      :",
+        "tidak perlu tangan keluar frame",
+    )
+    print("=" * 72)
+
+    tts = IndonesianTTS(
+        enabled=not args.no_tts,
+        voice=args.voice,
+        cache_dir=APP_DIR / ".tts_cache",
+    )
+
+    mp_pose = mp.solutions.pose
+    mp_hands = mp.solutions.hands
+
+    if args.video:
+        source = str(
+            Path(args.video)
+        )
+        cap = cv2.VideoCapture(
+            source
+        )
+    else:
+        source = int(
+            args.camera
+        )
+
+        if os.name == "nt":
+            cap = cv2.VideoCapture(
+                source,
+                cv2.CAP_DSHOW,
+            )
+        else:
+            cap = cv2.VideoCapture(
+                source
+            )
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Tidak bisa membuka input: {source}"
+        )
+
+    if not args.video:
+        cap.set(
+            cv2.CAP_PROP_FRAME_WIDTH,
+            args.width,
+        )
+        cap.set(
+            cv2.CAP_PROP_FRAME_HEIGHT,
+            args.height,
+        )
+        cap.set(
+            cv2.CAP_PROP_FPS,
+            args.camera_fps,
+        )
+
+    raw_window = deque(
+        maxlen=SEQ_LEN
+    )
+
+    prediction_history = deque(
+        maxlen=args.vote_window
+    )
+
+    sentence = []
+
+    prev_left_wrist = None
+    prev_right_wrist = None
+
+    frame_id = 0
+
+    current_pred = "-"
+    current_conf = 0.0
+    current_margin = 0.0
+    stable_text = "-"
+    accepted_text = "-"
+
+    last_emit_label = None
+    last_emit_time = 0.0
+
+    # After a word is emitted, the same class is LOCKED.
+    # It is only re-armed after a genuine uncertain/transition period.
+    # This avoids "Maaf Maaf Maaf" while one sign is still being held.
+    same_label_rearmed = True
+    neutral_streak = 0
+
+    quality = {
+        "observed_any": 0.0,
+        "valid_any": 0.0,
+        "left_valid": 0.0,
+        "right_valid": 0.0,
+    }
+
+    fps_samples = deque(
+        maxlen=30
+    )
+    last_loop = time.perf_counter()
+
+    WINDOW_NAME = "WL-BISINDO Hand134 Realtime"
+
+    # Keep the OpenCV window attached to the actual camera frame size.
+    # WINDOW_AUTOSIZE prevents a maximized/resized window from leaving
+    # a large gray unused area around the image.
+    cv2.namedWindow(
+        WINDOW_NAME,
+        cv2.WINDOW_AUTOSIZE,
+    )
+
+    print()
+    print("KEYBOARD")
+    print(" Q / ESC : keluar")
+    print(" C       : clear semua kata")
+    print(" X / B   : hapus kata terakhir")
+    print(" S       : speak kalimat saat ini")
+    print(" T       : toggle auto TTS")
+    print(" R       : reset temporal state")
+    print()
+
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=0,
+        smooth_landmarks=True,
+        enable_segmentation=False,
+        min_detection_confidence=0.40,
+        min_tracking_confidence=0.40,
+    ) as pose, mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        model_complexity=0,
+        min_detection_confidence=FULL_HAND_DET_CONF,
+        min_tracking_confidence=FULL_HAND_TRACK_CONF,
+    ) as hands, mp_hands.Hands(
+        static_image_mode=True,
+        max_num_hands=1,
+        model_complexity=0,
+        min_detection_confidence=RECOVERY_DET_CONF,
+    ) as recovery_hands:
+
+        try:
+            while True:
+                ok, frame = cap.read()
+
+                if not ok:
+                    if args.video:
+                        print(
+                            "[INFO] Video selesai."
+                        )
+                        break
+
+                    print(
+                        "[WARN] Frame kamera gagal dibaca."
+                    )
+                    continue
+
+                frame_id += 1
+
+                # Inference uses ORIGINAL frame, not mirrored display.
+                rgb = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB,
+                )
+                rgb.flags.writeable = False
+
+                pose_result = pose.process(
+                    rgb
+                )
+                hand_result = hands.process(
+                    rgb
+                )
+
+                (
+                    body_center,
+                    body_scale,
+                    left_pose_wrist,
+                    right_pose_wrist,
+                    pvalid,
+                ) = pose_anchor(
+                    pose_result
+                )
+
+                candidates = (
+                    collect_full_hand_candidates(
+                        hand_result
+                    )
+                )
+
+                assigned = (
+                    assign_candidates_to_body_sides(
+                        candidates,
+                        left_pose_wrist,
+                        right_pose_wrist,
+                        prev_left_wrist,
+                        prev_right_wrist,
+                    )
+                )
+
+                tracks = np.full(
+                    (
+                        NUM_HANDS,
+                        NUM_HAND_LANDMARKS,
+                        3,
+                    ),
+                    np.nan,
+                    dtype=np.float32,
+                )
+
+                observed = np.zeros(
+                    NUM_HANDS,
+                    dtype=np.uint8,
+                )
+
+                for side in [LEFT, RIGHT]:
+                    arr = assigned[side]
+
+                    if arr is not None:
+                        tracks[side] = arr
+                        observed[side] = 1
+
+                # Same ROI recovery as preprocessing V2.
+                if (
+                    not np.isfinite(
+                        tracks[LEFT]
+                    ).all()
+                    and left_pose_wrist
+                    is not None
+                ):
+                    recovered = (
+                        recover_hand_from_roi(
+                            frame,
+                            left_pose_wrist,
+                            body_scale,
+                            recovery_hands,
+                        )
+                    )
+
+                    if recovered is not None:
+                        tracks[LEFT] = recovered
+
+                if (
+                    not np.isfinite(
+                        tracks[RIGHT]
+                    ).all()
+                    and right_pose_wrist
+                    is not None
+                ):
+                    recovered = (
+                        recover_hand_from_roi(
+                            frame,
+                            right_pose_wrist,
+                            body_scale,
+                            recovery_hands,
+                        )
+                    )
+
+                    if recovered is not None:
+                        tracks[RIGHT] = recovered
+
+                if np.isfinite(
+                    tracks[LEFT]
+                ).all():
+                    prev_left_wrist = (
+                        tracks[
+                            LEFT,
+                            0,
+                        ].copy()
+                    )
+
+                if np.isfinite(
+                    tracks[RIGHT]
+                ).all():
+                    prev_right_wrist = (
+                        tracks[
+                            RIGHT,
+                            0,
+                        ].copy()
+                    )
+
+                raw_window.append(
+                    FrameState(
+                        tracks=tracks,
+                        observed=observed,
+                        body_center=body_center,
+                        body_scale=float(
+                            body_scale
+                        ),
+                        pose_valid=int(
+                            pvalid > 0.5
+                        ),
+                    )
+                )
+
+                can_infer = (
+                    len(raw_window) == SEQ_LEN
+                    and frame_id
+                    % args.infer_every
+                    == 0
+                )
+
+                if can_infer:
+                    (
+                        sequence,
+                        quality,
+                    ) = build_hand134_sequence(
+                        raw_window,
+                        feature_mean,
+                        feature_std,
+                    )
+
+                    (
+                        pred_id,
+                        conf,
+                        margin,
+                    ) = predict_sequence(
+                        model,
+                        sequence,
+                        device,
+                    )
+
+                    current_pred = labels.get(
+                        pred_id,
+                        str(pred_id),
+                    )
+                    current_conf = conf
+                    current_margin = margin
+
+                    passed = (
+                        conf >= args.threshold
+                        and margin
+                        >= args.min_margin
+                        and quality[
+                            "valid_any"
+                        ]
+                        >= args.min_valid_ratio
+                    )
+
+                    if passed:
+                        neutral_streak = 0
+
+                        prediction_history.append(
+                            (
+                                pred_id,
+                                conf,
+                            )
+                        )
+                    else:
+                        neutral_streak += 1
+
+                        # One uncertain inference should not erase
+                        # the rolling raw sequence.
+                        prediction_history.append(
+                            (
+                                -1,
+                                0.0,
+                            )
+                        )
+
+                        # IMPORTANT:
+                        # Repeating the SAME word is allowed only after
+                        # a short transition/uncertain period.
+                        # Hands may remain inside the camera frame.
+                        if (
+                            neutral_streak
+                            >= args.neutral_reset_hits
+                        ):
+                            same_label_rearmed = True
+                            stable_text = "-"
+
+                    valid_votes = [
+                        item
+                        for item
+                        in prediction_history
+                        if item[0] >= 0
+                    ]
+
+                    stable_id = None
+                    stable_count = 0
+                    stable_conf = 0.0
+
+                    if valid_votes:
+                        counts = Counter(
+                            p
+                            for p, _
+                            in valid_votes
+                        )
+
+                        (
+                            stable_id,
+                            stable_count,
+                        ) = counts.most_common(
+                            1
+                        )[0]
+
+                        stable_conf = float(
+                            np.mean(
+                                [
+                                    c
+                                    for p, c
+                                    in valid_votes
+                                    if p
+                                    == stable_id
+                                ]
+                            )
+                        )
+
+                    if (
+                        stable_id is not None
+                        and stable_count
+                        >= args.vote_hits
+                        and stable_conf
+                        >= args.threshold
+                    ):
+                        stable_text = labels.get(
+                            stable_id,
+                            str(stable_id),
+                        )
+
+                        now = time.monotonic()
+
+                        # Different class:
+                        # may emit immediately after the short change debounce.
+                        #
+                        # Same class:
+                        # NEVER repeats merely because time passed.
+                        # It must first be re-armed by a genuine transition
+                        # (several uncertain inferences). Hands do NOT need
+                        # to leave the frame.
+                        is_new_class = (
+                            last_emit_label is None
+                            or stable_id
+                            != last_emit_label
+                        )
+
+                        is_rearmed_same_class = (
+                            last_emit_label is not None
+                            and stable_id
+                            == last_emit_label
+                            and same_label_rearmed
+                        )
+
+                        debounce_ok = (
+                            now
+                            - last_emit_time
+                            >= args.change_cooldown
+                        )
+
+                        allowed = (
+                            debounce_ok
+                            and (
+                                is_new_class
+                                or is_rearmed_same_class
+                            )
+                        )
+
+                        if allowed:
+                            accepted_text = (
+                                stable_text
+                            )
+
+                            sentence.append(
+                                stable_text
+                            )
+
+                            last_emit_label = (
+                                stable_id
+                            )
+                            last_emit_time = now
+
+                            # Lock the currently accepted class.
+                            # Holding the same sign cannot emit it again.
+                            same_label_rearmed = False
+                            neutral_streak = 0
+
+                            # Clear only vote history.
+                            # DO NOT clear rolling raw_window.
+                            prediction_history.clear()
+
+                            print(
+                                f"[SIGN] "
+                                f"{stable_text:<15} "
+                                f"conf="
+                                f"{stable_conf:.3f} "
+                                f"margin="
+                                f"{margin:.3f}"
+                            )
+
+                            if (
+                                args.auto_speak
+                                and not args.no_tts
+                            ):
+                                tts.speak(
+                                    stable_text
+                                )
+
+                # FPS
+                now_perf = time.perf_counter()
+                dt = max(
+                    now_perf - last_loop,
+                    1e-9,
+                )
+                last_loop = now_perf
+                fps_samples.append(
+                    1.0 / dt
+                )
+                fps = float(
+                    np.mean(
+                        fps_samples
+                    )
+                )
+
+                # Draw on original coordinates.
+                vis = frame.copy()
+
+                draw_hand_points(
+                    vis,
+                    tracks[LEFT],
+                    (0, 255, 0),
+                )
+                draw_hand_points(
+                    vis,
+                    tracks[RIGHT],
+                    (255, 0, 255),
+                )
+
+                # Mirror DISPLAY only.
+                if not args.no_mirror:
+                    vis = cv2.flip(
+                        vis,
+                        1,
+                    )
+
+                # --------------------------------------------------
+                # Compact UI
+                # --------------------------------------------------
+                # Do not show a random class as if it were recognized
+                # when hand validity/confidence is still poor.
+                if len(raw_window) < SEQ_LEN:
+                    status_text = (
+                        f"Menyiapkan buffer "
+                        f"{len(raw_window)}/{SEQ_LEN}"
+                    )
+                    candidate_text = "-"
+                elif (
+                    quality["valid_any"]
+                    < args.min_valid_ratio
+                ):
+                    status_text = "Tangan belum terbaca"
+                    candidate_text = "-"
+                elif (
+                    current_conf < args.threshold
+                    or current_margin < args.min_margin
+                ):
+                    status_text = "Mendeteksi..."
+                    candidate_text = "-"
+                else:
+                    status_text = "Kandidat stabilisasi"
+                    candidate_text = (
+                        f"{current_pred} "
+                        f"({current_conf:.0%})"
+                    )
+
+                text_line = (
+                    " ".join(
+                        sentence[-6:]
+                    )
+                    if sentence
+                    else "-"
+                )
+
+                panel_x0 = 10
+                panel_y0 = 10
+                panel_x1 = min(
+                    vis.shape[1] - 10,
+                    590,
+                )
+                panel_y1 = 158
+
+                draw_translucent_panel(
+                    vis,
+                    panel_x0,
+                    panel_y0,
+                    panel_x1,
+                    panel_y1,
+                    alpha=0.58,
+                )
+
+                put_line(
+                    vis,
+                    f"Status: {status_text}",
+                    38,
+                    0.58,
+                    2,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    f"Kandidat: {candidate_text}",
+                    66,
+                    0.48,
+                    1,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    f"Terdeteksi: {accepted_text}",
+                    96,
+                    0.60,
+                    2,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    f"Teks: {text_line}",
+                    124,
+                    0.50,
+                    1,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    (
+                        f"Valid {quality['valid_any']:.0%} | "
+                        f"FPS {fps:.1f} | "
+                        f"TTS {'ON' if tts.enabled else 'OFF'}"
+                    ),
+                    150,
+                    0.43,
+                    1,
+                    20,
+                )
+
+                cv2.imshow(
+                    WINDOW_NAME,
+                    vis,
+                )
+
+                key = (
+                    cv2.waitKey(1)
+                    & 0xFF
+                )
+
+                if key in (
+                    27,
+                    ord("q"),
+                    ord("Q"),
+                ):
+                    break
+
+                if key in (
+                    ord("c"),
+                    ord("C"),
+                ):
+                    sentence.clear()
+                    accepted_text = "-"
+                    print(
+                        "[INFO] Text cleared."
+                    )
+
+                if key in (
+                    ord("x"),
+                    ord("X"),
+                    ord("b"),
+                    ord("B"),
+                ):
+                    if sentence:
+                        removed = (
+                            sentence.pop()
+                        )
+                        print(
+                            "[INFO] Removed:",
+                            removed,
+                        )
+
+                if key in (
+                    ord("s"),
+                    ord("S"),
+                ):
+                    if sentence:
+                        tts.speak(
+                            " ".join(
+                                sentence
+                            )
+                        )
+
+                if key in (
+                    ord("t"),
+                    ord("T"),
+                ):
+                    tts.toggle()
+
+                if key in (
+                    ord("r"),
+                    ord("R"),
+                ):
+                    raw_window.clear()
+                    prediction_history.clear()
+                    prev_left_wrist = None
+                    prev_right_wrist = None
+                    last_emit_label = None
+                    last_emit_time = 0.0
+                    same_label_rearmed = True
+                    neutral_streak = 0
+                    stable_text = "-"
+                    accepted_text = "-"
+                    current_pred = "-"
+                    current_conf = 0.0
+                    current_margin = 0.0
+
+                    print(
+                        "[INFO] Temporal state reset."
+                    )
+
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            tts.close()
+
+    print()
+    print("FINAL TEXT")
+    print(
+        " ".join(sentence)
+        if sentence
+        else "-"
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "WL-BISINDO Hand134 Transformer V4 "
+            "local realtime."
+        )
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=str(
+            DEFAULT_MODEL_PATH
+        ),
+    )
+    parser.add_argument(
+        "--mean",
+        type=str,
+        default=str(
+            DEFAULT_MEAN_PATH
+        ),
+    )
+    parser.add_argument(
+        "--std",
+        type=str,
+        default=str(
+            DEFAULT_STD_PATH
+        ),
+    )
+    parser.add_argument(
+        "--mapping",
+        type=str,
+        default=str(
+            DEFAULT_MAPPING_PATH
+        ),
+    )
+
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.75,
+    )
+    parser.add_argument(
+        "--min-margin",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--min-valid-ratio",
+        type=float,
+        default=0.25,
+    )
+
+    parser.add_argument(
+        "--vote-window",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--vote-hits",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--infer-every",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--change-cooldown",
+        type=float,
+        default=0.20,
+        help=(
+            "Minimum detik antara kata berbeda. "
+            "Tidak membutuhkan tangan keluar."
+        ),
+    )
+    parser.add_argument(
+        "--neutral-reset-hits",
+        type=int,
+        default=3,
+        help=(
+            "Jumlah inference transisi/uncertain untuk "
+            "mengizinkan kelas yang sama diucapkan lagi. "
+            "Tidak perlu tangan keluar frame."
+        ),
+    )
+
+    parser.add_argument(
+        "--voice",
+        type=str,
+        default="id-ID-ArdiNeural",
+    )
+    parser.add_argument(
+        "--no-tts",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--auto-speak",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-mirror",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=960,
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=540,
+    )
+    parser.add_argument(
+        "--camera-fps",
+        type=int,
+        default=30,
+    )
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+
+    if args.vote_hits > args.vote_window:
+        raise ValueError(
+            "--vote-hits tidak boleh lebih besar "
+            "dari --vote-window"
+        )
+
+    if args.infer_every < 1:
+        raise ValueError(
+            "--infer-every minimal 1"
+        )
+
+    run(args)
