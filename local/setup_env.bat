@@ -18,13 +18,7 @@ if errorlevel 1 (
 if not exist ".venv\Scripts\python.exe" (
     echo [1/6] Membuat .venv dengan Python 3.11...
     py -3.11 -m venv .venv
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] Python 3.11 tidak ditemukan.
-        echo Cek instalasi dengan: py -0p
-        pause
-        exit /b 1
-    )
+    if errorlevel 1 goto :error
 ) else (
     echo [1/6] .venv sudah ada - skip create.
 )
@@ -41,10 +35,15 @@ echo [4/6] Install dependency...
 python -m pip install -r requirements.txt
 if errorlevel 1 goto :error
 
-echo [5/6] Menyiapkan folder model...
-if not exist "model" mkdir model
+echo [5/6] Menyiapkan model registry lokal...
+if not exist "models" mkdir models
+if not exist "models\v1" mkdir models\v1
 
-echo [6/6] Cek dependency...
+if not exist "active_model.txt" (
+    echo v1>active_model.txt
+)
+
+echo [6/6] Cek dependency dan active model...
 python check_setup.py --allow-missing-model
 if errorlevel 1 goto :error
 
@@ -53,14 +52,14 @@ echo ================================================================
 echo SETUP SELESAI
 echo ================================================================
 echo.
-echo Setelah training Kaggle selesai, copy ke folder model:
-echo   wl_bisindo_hand134_transformer_traced.pt
-echo   feature_mean.npy
-echo   feature_std.npy
-echo   class_mapping.json
+echo Pilih model melalui:
+echo   active_model.txt
 echo.
-echo Setelah itu jalankan:
-echo   run.bat
+echo Contoh isi:
+echo   v1
+echo.
+echo File model harus berada di:
+echo   models\v1\
 echo.
 pause
 exit /b 0

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from pathlib import Path
 import argparse
 import json
 import sys
 
 ROOT = Path(__file__).resolve().parent
-MODEL_DIR = ROOT / "model"
+ACTIVE_MODEL_FILE = ROOT / "active_model.txt"
+MODEL_ROOT = ROOT / "models"
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -14,96 +17,136 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+
+def get_active_version():
+    if not ACTIVE_MODEL_FILE.exists():
+        raise FileNotFoundError(
+            f"active_model.txt tidak ditemukan: {ACTIVE_MODEL_FILE}"
+        )
+
+    version = ACTIVE_MODEL_FILE.read_text(
+        encoding="utf-8"
+    ).strip()
+
+    if not version:
+        raise ValueError(
+            "active_model.txt kosong. Isi misalnya: v1"
+        )
+
+    if any(ch in version for ch in ("/", "\\", "..")):
+        raise ValueError(
+            "active_model.txt hanya boleh berisi nama folder, "
+            "misalnya v1 atau v2."
+        )
+
+    return version
+
+
+active_version = get_active_version()
+model_dir = MODEL_ROOT / active_version
+
 print("=" * 72)
 print("WL-BISINDO LOCAL REALTIME - SETUP CHECK")
 print("=" * 72)
-print("Python    :", sys.version.split()[0])
+print("Python       :", sys.version.split()[0])
+print("Active model :", active_version)
+print("Model folder :", model_dir)
 
 errors = []
 warnings = []
 
 try:
     import numpy as np
-    print("NumPy     :", np.__version__)
+    print("NumPy        :", np.__version__)
 except Exception as exc:
     errors.append(f"NumPy: {exc}")
 
 try:
     import cv2
-    print("OpenCV    :", cv2.__version__)
+    print("OpenCV       :", cv2.__version__)
 except Exception as exc:
     errors.append(f"OpenCV: {exc}")
 
 try:
     import mediapipe as mp
-    print("MediaPipe :", mp.__version__)
+    print("MediaPipe    :", mp.__version__)
 except Exception as exc:
     errors.append(f"MediaPipe: {exc}")
 
 try:
     import torch
-    print("PyTorch   :", torch.__version__)
-    print("CUDA      :", torch.cuda.is_available())
+    print("PyTorch      :", torch.__version__)
+    print("CUDA         :", torch.cuda.is_available())
     if torch.cuda.is_available():
-        print("GPU       :", torch.cuda.get_device_name(0))
+        print("GPU          :", torch.cuda.get_device_name(0))
 except Exception as exc:
     errors.append(f"PyTorch: {exc}")
 
 try:
     import edge_tts
-    print("edge-tts  : OK")
+    print("edge-tts     : OK")
 except Exception as exc:
     errors.append(f"edge-tts: {exc}")
 
 try:
     import pygame
-    print("pygame    :", pygame.version.ver)
+    print("pygame       :", pygame.version.ver)
 except Exception as exc:
     errors.append(f"pygame: {exc}")
 
 if sys.version_info[:2] != (3, 11):
     warnings.append(
-        "Python 3.11 x64 direkomendasikan untuk runtime ini."
+        "Python 3.11 x64 direkomendasikan."
     )
 
 required = [
-    MODEL_DIR / "wl_bisindo_hand134_transformer_traced.pt",
-    MODEL_DIR / "feature_mean.npy",
-    MODEL_DIR / "feature_std.npy",
-    MODEL_DIR / "class_mapping.json",
+    model_dir / "wl_bisindo_hand134_transformer_traced.pt",
+    model_dir / "feature_mean.npy",
+    model_dir / "feature_std.npy",
+    model_dir / "class_mapping.json",
 ]
 
 print()
-print("MODEL FILES")
+print("ACTIVE MODEL FILES")
 
-missing_model = []
+missing = []
 
 for path in required:
     ok = path.exists()
-    print(f"{'[OK]' if ok else '[MISSING]':<10} {path.name}")
+    print(
+        f"{'[OK]' if ok else '[MISSING]':<10} {path.name}"
+    )
     if not ok:
-        missing_model.append(path)
+        missing.append(path)
 
-if missing_model and not args.allow_missing_model:
+if missing and not args.allow_missing_model:
     errors.extend(
         f"Missing: {path}"
-        for path in missing_model
+        for path in missing
     )
 
-if not missing_model:
+if not missing:
     import numpy as np
     import torch
 
     mean = np.load(
-        MODEL_DIR / "feature_mean.npy"
+        model_dir / "feature_mean.npy"
     )
     std = np.load(
-        MODEL_DIR / "feature_std.npy"
+        model_dir / "feature_std.npy"
     )
 
+    with open(
+        model_dir / "class_mapping.json",
+        "r",
+        encoding="utf-8",
+    ) as f:
+        mapping = json.load(f)
+
     print()
-    print("feature_mean:", mean.shape)
-    print("feature_std :", std.shape)
+    print("feature_mean :", mean.shape)
+    print("feature_std  :", std.shape)
+    print("Classes      :", len(mapping))
 
     if mean.shape != (134,):
         errors.append(
@@ -115,18 +158,9 @@ if not missing_model:
             f"feature_std harus (134,), found {std.shape}"
         )
 
-    with open(
-        MODEL_DIR / "class_mapping.json",
-        "r",
-        encoding="utf-8",
-    ) as f:
-        mapping = json.load(f)
-
-    print("Classes     :", len(mapping))
-
     if len(mapping) != 32:
         errors.append(
-            f"class mapping harus 32 class, found {len(mapping)}"
+            f"class_mapping harus 32 kelas, found {len(mapping)}"
         )
 
     if not errors:
@@ -138,7 +172,7 @@ if not missing_model:
 
         model = torch.jit.load(
             str(
-                MODEL_DIR
+                model_dir
                 / "wl_bisindo_hand134_transformer_traced.pt"
             ),
             map_location=device,
@@ -155,27 +189,23 @@ if not missing_model:
         with torch.inference_mode():
             out = model(dummy)
 
-        print("Model output:", tuple(out.shape))
+        print("Model output :", tuple(out.shape))
 
         if tuple(out.shape) != (1, 32):
             errors.append(
-                "Output model harus (1,32), "
-                f"found {tuple(out.shape)}"
+                f"Output model harus (1, 32), found {tuple(out.shape)}"
             )
 
-print()
+for warning in warnings:
+    print("[WARN]", warning)
 
-for item in warnings:
-    print("[WARN]", item)
-
-if missing_model and args.allow_missing_model:
+if missing and args.allow_missing_model:
     print()
     print(
-        "[INFO] Dependency siap, tetapi model belum dicopy."
+        "[INFO] Dependency siap, model aktif belum lengkap."
     )
     print(
-        "[INFO] Setelah training Kaggle selesai, copy 4 file "
-        "runtime ke folder local/model/."
+        f"[INFO] Taruh file model di: models/{active_version}/"
     )
 
 if errors:
@@ -186,8 +216,5 @@ if errors:
     raise SystemExit(1)
 
 print()
-print("✅ SETUP DEPENDENCY SIAP")
-
-if not missing_model:
-    print("✅ MODEL RUNTIME SIAP")
-    print("Jalankan: run.bat")
+print("✅ SETUP SIAP")
+print(f"✅ ACTIVE MODEL: {active_version}")

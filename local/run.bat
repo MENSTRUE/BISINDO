@@ -11,11 +11,16 @@ if not exist ".venv\Scripts\activate.bat" (
 
 call .venv\Scripts\activate.bat
 
+echo.
+echo Active model:
+type active_model.txt
+echo.
+
 python check_setup.py
 if errorlevel 1 (
     echo.
-    echo [ERROR] Runtime belum siap.
-    echo Pastikan 4 file model dari Kaggle sudah berada di folder model.
+    echo [ERROR] Active model belum siap.
+    echo Cek active_model.txt dan folder models\VERSION\
     pause
     exit /b 1
 )

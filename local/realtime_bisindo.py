@@ -58,7 +58,38 @@ import mediapipe as mp
 # ============================================================
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_DIR = APP_DIR / "model"
+
+ACTIVE_MODEL_FILE = APP_DIR / "active_model.txt"
+MODEL_ROOT = APP_DIR / "models"
+
+
+def get_active_model_version() -> str:
+    if not ACTIVE_MODEL_FILE.exists():
+        raise FileNotFoundError(
+            f"active_model.txt tidak ditemukan: {ACTIVE_MODEL_FILE}"
+        )
+
+    version = ACTIVE_MODEL_FILE.read_text(
+        encoding="utf-8"
+    ).strip()
+
+    if not version:
+        raise ValueError(
+            "active_model.txt kosong. Isi misalnya: v1"
+        )
+
+    # Keep selector simple and safe: v1, v2, v3, model_a, etc.
+    if any(ch in version for ch in ("/", "\\", "..")):
+        raise ValueError(
+            "active_model.txt hanya boleh berisi nama folder model, "
+            "misalnya v1 atau v2."
+        )
+
+    return version
+
+
+ACTIVE_MODEL_VERSION = get_active_model_version()
+DEFAULT_MODEL_DIR = MODEL_ROOT / ACTIVE_MODEL_VERSION
 
 DEFAULT_MODEL_PATH = (
     DEFAULT_MODEL_DIR / "wl_bisindo_hand134_transformer_traced.pt"
@@ -1460,6 +1491,14 @@ def run(args):
         "WL-BISINDO HAND134 TRANSFORMER V4 — FAST CONTINUOUS"
     )
     print("=" * 72)
+    print(
+        "Active model   :",
+        ACTIVE_MODEL_VERSION,
+    )
+    print(
+        "Model folder   :",
+        DEFAULT_MODEL_DIR,
+    )
     print(
         "Device         :",
         device,
