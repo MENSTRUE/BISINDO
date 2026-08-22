@@ -1,17 +1,17 @@
-# WL-BISINDO Hand134 Transformer — Kaggle Training + Local Realtime
+# WL-BISINDO Hand134 Transformer
 
-Prototype pengenalan **32 kosakata isolated BISINDO** menggunakan fitur dua tangan (*Hand134*) dan *Dual-Hand Temporal Transformer*.
+Real-time **isolated BISINDO word recognition** prototype using dual-hand landmark features (*Hand134*) and a **Dual-Hand Temporal Transformer**.
 
-Repository/paket ini sengaja memisahkan dua lingkungan:
+The project separates model development from local deployment:
 
-- **Kaggle** → preprocessing dataset dan training model.
-- **Local PC** → pengujian webcam/video, output teks, dan Indonesian Neural TTS.
+- **Kaggle** — preprocessing, training, evaluation, and model export.
+- **Local PC** — webcam/video inference, text output, and Indonesian Neural TTS.
 
-> Preprocessing dataset sudah dilakukan terpisah. Notebook training di paket ini **tidak membaca video mentah dan tidak menjalankan preprocessing ulang**.
+> The current model recognizes **32 isolated BISINDO vocabulary classes**. It is not yet a full continuous sign-language translation system.
 
 ---
 
-## Pipeline
+## Project Overview
 
 ```text
 KAGGLE
@@ -20,40 +20,97 @@ Raw WL-BISINDO videos
 Preprocessing V2
 MediaPipe Pose (helper) + MediaPipe Hands
         ↓
-48 frame × 134 fitur tangan
+48 frames × 134 hand features
         ↓
-Kaggle Dataset:
-preprocessing-output-bisindo
+Preprocessed Kaggle Dataset
         ↓
-Training V4
 Dual-Hand Temporal Transformer
         ↓
-TorchScript + feature mean/std + class mapping
+Evaluation + checkpoint + TorchScript export
 
 LOCAL PC
 Webcam / video
         ↓
-Preprocessing realtime yang sama
+Realtime Hand134 preprocessing
         ↓
-Rolling 48-frame Hand134 sequence
+Rolling 48-frame temporal window
         ↓
-TorchScript model
+Feature normalization
         ↓
-Prediction voting
+TorchScript inference
         ↓
-Teks
+Confidence + margin + temporal voting
+        ↓
+Recognized text
         ↓
 Indonesian Neural TTS
 ```
 
 ---
 
-## Struktur paket
+## Model Performance
+
+Final signer-independent evaluation:
+
+| Metric | Result |
+|---|---:|
+| Best development epoch | 18 |
+| Best development Macro-F1 | 94.93% |
+| Final unseen-signer accuracy | 86.56% |
+| Final unseen-signer Macro-F1 | 85.73% |
+| Zero-F1 classes | 0 |
+| Final test signer | Signer 4 |
+
+The final evaluation uses **Signer 4 as an unseen signer**, while Signers 0–3 are used for model development and final retraining.
+
+> Dataset-level accuracy does not guarantee identical webcam performance. Lighting, camera quality, distance, background, signer style, and landmark quality can affect real-world inference.
+
+---
+
+## Architecture
 
 ```text
-WL_BISINDO_FINAL_KAGGLE_LOCAL/
+Left Hand (67 features) ──→ Left Hand Encoder ──┐
+                                                ├─→ Fusion
+Right Hand (67 features) → Right Hand Encoder ──┘
+                                                     ↓
+                                              Temporal Conv
+                                                     ↓
+                                             Transformer Encoder
+                                                     ↓
+                                               Classification Head
+                                                     ↓
+                                                  32 classes
+```
+
+Input shape:
+
+```text
+[B, 48, 134]
+```
+
+Per hand:
+
+```text
+21 landmarks × (x, y, z) local to wrist = 63
+global wrist relative to body anchor     = 3
+hand presence flag                       = 1
+------------------------------------------------
+per hand                                 = 67
+two hands                                = 134
+```
+
+**MediaPipe Pose is not part of the model input.** It is used only as a helper for body center, body scale, and anatomical wrist references.
+
+---
+
+## Repository Structure
+
+```text
+BISINDO/
 │
 ├── README.md
+├── .gitignore
 │
 ├── kaggle/
 │   └── 02_WL_BISINDO_TRAIN_V4_HAND134_TRANSFORMER_FINAL_KAGGLE.ipynb
@@ -66,22 +123,27 @@ WL_BISINDO_FINAL_KAGGLE_LOCAL/
     ├── run.bat
     │
     └── model/
-        └── COPY_MODEL_FILES_HERE.txt
+        ├── class_mapping.json
+        ├── feature_mean.npy
+        ├── feature_std.npy
+        └── wl_bisindo_hand134_transformer_traced.pt
 ```
+
+Large model weights, datasets, virtual environments, caches, and raw videos should not be committed directly to Git.
 
 ---
 
-# A. Kaggle — Training
+# Kaggle Workflow
 
-## Input
+## 1. Preprocessed Input
 
-Notebook training langsung membaca hasil preprocessing dari:
+The training notebook reads the preprocessed Hand134 dataset from:
 
 ```text
 /kaggle/input/datasets/loliwibu/preprocessing-output-bisindo
 ```
 
-File preprocessing yang dipakai:
+Expected files:
 
 ```text
 X_hands134.npy
@@ -95,52 +157,93 @@ metadata.csv
 class_mapping.json
 ```
 
-Input model:
+Expected core shapes:
 
 ```text
-48 timestep × 134 fitur
+X_hands134.npy         : (1600, 48, 134)
+hand_observed_mask.npy : (1600, 48, 2)
+hand_valid_mask.npy    : (1600, 48, 2)
+labels.npy             : (1600,)
+signer_ids.npy         : (1600,)
 ```
 
-Per tangan:
+The training notebook does **not** re-run raw-video preprocessing.
+
+---
+
+## 2. Signer-Independent Protocol
+
+Development protocol:
 
 ```text
-21 landmark × (x,y,z) lokal terhadap wrist = 63
-wrist global terhadap body anchor          = 3
-presence                                    = 1
-------------------------------------------------
-per hand                                   = 67
-dua tangan                                 = 134
+Signer 0–3 → development pool
+Signer 4   → final unseen test
 ```
 
-Pose **tidak masuk sebagai fitur model**. Pose hanya membantu memperoleh *shoulder center*, *body scale*, dan referensi wrist anatomis.
+The notebook attempts to use one complete development signer as unseen-signer validation. After selecting the best epoch, the model is reinitialized and trained again on all Signers 0–3 before evaluating Signer 4 once.
 
-## Menjalankan
+---
 
-1. Attach Kaggle Dataset `preprocessing-output-bisindo`.
-2. Aktifkan GPU.
-3. Buka notebook:
-   ```text
-   kaggle/02_WL_BISINDO_TRAIN_V4_HAND134_TRANSFORMER_FINAL_KAGGLE.ipynb
-   ```
-4. Jalankan semua cell.
-5. Untuk run panjang gunakan **Save Version → Save & Run All**.
+## 3. Training Configuration
 
-Di bagian awal harus muncul:
+Main configuration:
 
 ```text
-Using: /kaggle/input/datasets/loliwibu/preprocessing-output-bisindo
+Sequence length       : 48
+Feature dimension     : 134
+Classes               : 32
+Hand embedding        : 96
+Transformer dimension : 192
+Attention heads       : 6
+Transformer layers    : 3
+Feed-forward dimension: 384
+Dropout               : 0.25
+
+Batch size            : 64
+Learning rate         : 3e-4
+Weight decay          : 1e-3
+Label smoothing       : 0.03
+Gradient clipping     : 1.0
+Max development epoch : 100
+Early stopping        : 15
+```
+
+Training augmentation includes:
+
+- temporal speed resampling,
+- temporal shift,
+- coordinate noise,
+- short frame masking,
+- occasional single-hand dropout.
+
+---
+
+## 4. Run on Kaggle
+
+1. Attach the preprocessed dataset.
+2. Enable a GPU accelerator.
+3. Open:
+
+```text
+kaggle/02_WL_BISINDO_TRAIN_V4_HAND134_TRANSFORMER_FINAL_KAGGLE.ipynb
+```
+
+4. Run all cells.
+5. For long runs, use **Save Version → Save & Run All**.
+
+Expected input checks:
+
+```text
 ✅ All preprocessing V2 files found
-```
-
-dan integrity check:
-
-```text
 ✅ Input integrity PASSED
+✅ DataLoader PASSED
 ```
 
-## Output runtime yang wajib diambil
+---
 
-Setelah training selesai, ambil minimal:
+## 5. Deployment Artifacts
+
+For local inference, copy these files from Kaggle output:
 
 ```text
 wl_bisindo_hand134_transformer_traced.pt
@@ -149,93 +252,93 @@ feature_std.npy
 class_mapping.json
 ```
 
-Kemudian copy ke:
+Place them in:
 
 ```text
 local/model/
 ```
 
-Struktur akhirnya:
+For future fine-tuning, also keep the regular PyTorch checkpoint:
 
 ```text
-local/
-├── realtime_bisindo.py
-├── check_setup.py
-├── requirements.txt
-├── setup_env.bat
-├── run.bat
-│
-└── model/
-    ├── wl_bisindo_hand134_transformer_traced.pt
-    ├── feature_mean.npy
-    ├── feature_std.npy
-    └── class_mapping.json
+hand134_transformer_final.pt
+```
+
+> Use the regular PyTorch checkpoint for further training. The TorchScript file is intended for inference/deployment.
+
+---
+
+# Local Realtime
+
+## 1. Requirements
+
+Recommended environment:
+
+```text
+Python 3.11 x64
+```
+
+Main runtime dependencies:
+
+```text
+numpy
+opencv-contrib-python
+mediapipe
+torch
+edge-tts
+pygame
 ```
 
 ---
 
-# B. Local PC — Setup
+## 2. Windows Setup
 
-Runtime lokal direkomendasikan menggunakan **Python 3.11 x64**.
+Open a terminal inside:
 
-## Setup otomatis Windows
+```text
+local/
+```
 
-Buka terminal pada folder `local/`, lalu:
+Run once:
 
 ```bat
 setup_env.bat
 ```
 
-Script akan:
+The script will:
 
 ```text
-1. membuat .venv
-2. mengaktifkan environment
-3. upgrade pip
-4. install dependency
-5. membuat folder model
-6. memeriksa environment
+1. create .venv
+2. activate the environment
+3. upgrade pip tooling
+4. install dependencies
+5. verify runtime files
+6. test model input/output shape
 ```
 
-Setelah 4 file hasil training sudah berada di `local/model/`, jalankan:
+After setup:
 
 ```bat
 run.bat
 ```
 
-`run.bat` otomatis mengaktifkan `.venv`, menjalankan pengecekan model, kemudian membuka realtime webcam.
-
-Argumen juga dapat diteruskan melalui `run.bat`, misalnya:
-
-```bat
-run.bat --camera 1
-```
-
-atau:
-
-```bat
-run.bat --threshold 0.80 --infer-every 2
-```
-
 ---
 
-# C. Local PC — Menjalankan Manual
+## 3. Manual Run
 
-Aktifkan environment:
-
-### Command Prompt
+Command Prompt:
 
 ```bat
 .venv\Scripts\activate.bat
 ```
 
-### PowerShell
+PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-Kemudian:
+Then:
 
 ```bash
 python check_setup.py
@@ -244,218 +347,227 @@ python realtime_bisindo.py
 
 ---
 
-# D. Fast Continuous Recognition
+# Fast Continuous Realtime Logic
 
-Versi realtime ini memperbaiki perilaku lama yang membuat pengguna harus menurunkan/mengeluarkan tangan sebelum gesture berikutnya.
-
-Sekarang:
+The local runtime uses a rolling temporal window. It does **not** require the user's hands to leave the frame before recognizing the next gesture.
 
 ```text
-Camera
+Webcam
   ↓
-MediaPipe Pose + Hands
+Pose + Hands
   ↓
-rolling raw landmark window 48 frame
+rolling 48-frame landmark window
   ↓
-interpolation + EMA
+short-gap interpolation
   ↓
-Hand134
+EMA smoothing
+  ↓
+Hand134 feature construction
   ↓
 feature normalization
   ↓
-Transformer
-  ↓
-inferensi setiap 2 frame
+Transformer inference
   ↓
 confidence + top1/top2 margin
   ↓
-temporal voting 2 dari 3
+temporal voting
   ↓
-kata diterima
+accepted word
 ```
 
-Yang penting:
+Important behavior:
 
-```text
-raw rolling window TIDAK dihapus setelah kata diterima
-```
-
-dan **tidak ada syarat `hand_disappeared == True`**.
-
-Jadi alurnya dapat berupa:
-
-```text
-gesture A
-   ↓
-A diterima
-   ↓
-tangan tetap berada di frame
-   ↓
-langsung gesture B
-   ↓
-rolling window terus bergerak
-   ↓
-B diterima
-```
-
-Untuk kelas yang **berbeda**, default *debounce* hanya:
-
-```text
-change_cooldown = 0.20 detik
-```
-
-Untuk mengulang kelas yang sama tanpa mengeluarkan tangan:
-
-```text
-repeat_cooldown = 1.60 detik
-```
-
-Cooldown kelas yang sama lebih panjang untuk mengurangi kata yang terus terulang ketika satu gesture ditahan.
+- The 48-frame rolling buffer is **not cleared** after a word is accepted.
+- A different gesture can follow while the hands remain visible.
+- A held gesture is accepted only once.
+- The same class is re-armed only after a genuine transition/uncertain period.
+- Low-confidence raw predictions are not presented as accepted words.
+- TTS keeps only the newest pending utterance to avoid stale audio queues.
 
 ---
 
-# E. Parameter Realtime
+## Realtime Parameters
 
-Default:
+Default behavior is tuned for responsive local inference:
 
 ```text
-sequence length  = 48
-feature dim      = 134
-threshold        = 0.75
-min margin       = 0.10
-minimum valid    = 0.25
-vote window      = 3
-vote hits        = 2
-infer every      = 2 frame
-change cooldown  = 0.20 s
-repeat cooldown  = 1.60 s
+sequence length       = 48
+feature dimension     = 134
+threshold             = 0.75
+minimum margin        = 0.10
+minimum valid ratio   = 0.25
+vote window           = 3
+vote hits             = 2
+infer every           = 2 frames
+change cooldown       = 0.20 s
+neutral reset hits    = 3
 ```
 
-Lebih responsif:
+More responsive:
 
 ```bash
 python realtime_bisindo.py --infer-every 1
 ```
 
-Kalau terlalu banyak *false positive*:
+More conservative:
 
 ```bash
 python realtime_bisindo.py --threshold 0.82 --min-margin 0.15
 ```
 
-Kalau prediksi terlalu susah keluar:
+More permissive:
 
 ```bash
 python realtime_bisindo.py --threshold 0.68 --min-margin 0.08
 ```
 
-Webcam lain:
+Use another camera:
 
 ```bash
 python realtime_bisindo.py --camera 1
 ```
 
-Paksa CPU:
+Force CPU:
 
 ```bash
 python realtime_bisindo.py --cpu
 ```
 
-Tanpa mirror preview:
+Disable mirrored preview:
 
 ```bash
 python realtime_bisindo.py --no-mirror
 ```
 
-Test video:
+Test a video:
 
 ```bash
 python realtime_bisindo.py --video "path/to/video.mp4"
 ```
 
-Semua contoh path di README bersifat relatif/generik dan tidak bergantung pada struktur folder komputer tertentu.
-
 ---
 
-# F. Indonesian Neural TTS
+# Indonesian Neural TTS
 
-Realtime menggunakan **Microsoft Edge Neural TTS**.
+The local runtime uses **Microsoft Edge Neural TTS**.
 
-Default:
+Default voice:
 
 ```text
 id-ID-ArdiNeural
 ```
 
-Voice alternatif:
+Alternative voice:
 
 ```text
 id-ID-GadisNeural
 ```
 
-Jalankan voice perempuan:
+Example:
 
 ```bash
 python realtime_bisindo.py --voice id-ID-GadisNeural
 ```
 
-TTS dibuat asynchronous sehingga audio tidak menghentikan kamera atau inferensi.
-
-Kata yang sudah dibuat disimpan di:
-
-```text
-local/.tts_cache/
-```
-
-Jika suatu kata sudah ada di cache, audio berikutnya dapat diputar tanpa membuat file baru.
-
-> Edge TTS memerlukan internet ketika audio suatu kata belum tersedia di cache. Jika TTS gagal, recognition tetap berjalan.
-
-Matikan TTS:
+Disable TTS:
 
 ```bash
 python realtime_bisindo.py --no-tts
 ```
 
-Matikan auto-speak tetapi tetap izinkan tombol `S`:
+Disable automatic speech while keeping manual speech available:
 
 ```bash
 python realtime_bisindo.py --no-auto-speak
 ```
 
----
-
-# G. Keyboard
-
-Saat realtime:
+Generated audio is cached locally in:
 
 ```text
-Q / ESC = keluar
-C       = hapus seluruh text buffer
-X / B   = hapus kata terakhir
-S       = bacakan seluruh text buffer
+local/.tts_cache/
+```
+
+Edge TTS may require internet access when a requested utterance is not yet cached.
+
+---
+
+# Keyboard Controls
+
+```text
+Q / ESC = exit
+C       = clear text buffer
+X / B   = remove last word
+S       = speak current text buffer
 T       = toggle TTS
 R       = reset temporal state
 ```
 
 ---
 
-# H. Kenapa Preview Bisa Mirror?
+# Fine-Tuning with New Data
 
-Inference selalu memakai **frame asli** supaya konsisten dengan preprocessing dataset.
+The model can be fine-tuned later when additional BISINDO data becomes available.
 
-Mirror hanya dilakukan pada tampilan:
+## Same 32 classes
+
+Recommended flow:
 
 ```text
-model input = original frame
-preview     = mirrored frame
+new videos
+   ↓
+run the SAME Hand134 preprocessing
+   ↓
+48 × 134 feature sequences
+   ↓
+load hand134_transformer_final.pt
+   ↓
+fine-tune with a lower learning rate
+   ↓
+re-evaluate signer-independently
+   ↓
+export a new TorchScript model
 ```
 
-Ini disengaja.
+Suggested starting learning rate:
+
+```text
+1e-5 to 5e-5
+```
+
+Do not fine-tune only on the new dataset if it is very small. Mix old and new training samples to reduce **catastrophic forgetting**.
+
+## Adding new classes
+
+If new vocabulary classes are added:
+
+```text
+32 classes → N classes
+```
+
+the final classification head and `class_mapping.json` must be expanded.
+
+A common strategy is:
+
+1. load the previous feature encoders and Transformer weights,
+2. replace the final classification layer,
+3. initialize the new output head,
+4. train the head first,
+5. unfreeze the full network with a small learning rate,
+6. evaluate on unseen signers.
+
+## Local vs Kaggle fine-tuning
+
+Fine-tuning is technically possible on a local PC, but:
+
+- **CUDA GPU available** → local fine-tuning is practical.
+- **CPU only** → possible, but significantly slower.
+- **Kaggle GPU** → usually more convenient for repeated experiments.
+
+For deployment, keep using TorchScript. For training/fine-tuning, keep the normal PyTorch checkpoint.
 
 ---
 
-# I. Mapping 32 Kelas WL-BISINDO
+# Vocabulary
 
 ```text
 0  Air
@@ -494,26 +606,24 @@ Ini disengaja.
 
 ---
 
-# J. Keterbatasan
+# Current Limitations
 
-Model saat ini adalah **isolated BISINDO word recognition**, bukan penerjemah BISINDO continuous penuh.
-
-Saat ini:
+The current system is an **isolated-word recognition prototype**:
 
 ```text
 gesture → recognized word → text → TTS
 ```
 
-Belum:
+It is not yet:
 
 ```text
 continuous sign stream
-→ sign segmentation
-→ sentence grammar translation
-→ natural language generation
+→ automatic sign segmentation
+→ BISINDO grammar translation
+→ natural Indonesian sentence generation
 ```
 
-Dataset/model juga belum memiliki kelas eksplisit:
+The current model also does not include explicit:
 
 ```text
 no_sign
@@ -521,27 +631,41 @@ background
 transition
 ```
 
-Karena itu threshold dan voting tetap diperlukan untuk mengurangi prediksi saat pengguna tidak sedang membuat salah satu dari 32 gesture.
+classes.
 
-Untuk pengembangan berikutnya, kelas `no_sign/background/transition` dan dataset gesture berurutan akan membantu continuous recognition menjadi lebih stabil.
+Therefore, thresholding, confidence margin, temporal voting, and transition logic are still required to reduce false positives.
+
+Future work may include:
+
+- explicit `no_sign/background/transition` samples,
+- more signers,
+- broader lighting/background variation,
+- additional regional BISINDO data,
+- continuous sign segmentation,
+- sequence-to-text translation,
+- language-model-based sentence refinement,
+- mobile or edge deployment.
 
 ---
 
-# K. Ringkasan Environment
+# Notes
+
+- Inference uses the **original camera frame** for consistency with dataset preprocessing.
+- Mirroring is applied only to the preview.
+- Model weights and datasets are intentionally excluded from normal Git commits when they are too large.
+- Keep the original checkpoint separately if future fine-tuning is planned.
+
+---
+
+## Status
 
 ```text
-Kaggle:
-- preprocessing
-- training
-- evaluation
-- export model
-
-Local PC:
-- webcam/video test
-- Hand134 preprocessing realtime
-- TorchScript inference
-- text buffer
-- Indonesian Neural TTS
+Preprocessing        ✅
+Signer-independent training ✅
+Final unseen-signer evaluation ✅
+TorchScript export   ✅
+Local webcam inference ✅
+Fast sequential gesture handling ✅
+Indonesian Neural TTS ✅
+Full continuous BISINDO translation 🚧
 ```
-
-Dengan pemisahan ini, preprocessing/training Kaggle tidak tercampur dengan kode implementasi lokal.
