@@ -1,0 +1,35 @@
+﻿dataset,class,train,validation,test,unspecified,video,image,total
+A Multimodal BISINDO Corpus Annotated Images and V,A,993,0,88,0,0,1081,1081
+A Multimodal BISINDO Corpus Annotated Images and V,B,1051,0,233,0,0,1284,1284
+A Multimodal BISINDO Corpus Annotated Images and V,C,990,0,77,0,0,1067,1067
+A Multimodal BISINDO Corpus Annotated Images and V,D,916,0,69,0,0,985,985
+A Multimodal BISINDO Corpus Annotated Images and V,E,1023,0,83,0,0,1106,1106
+A Multimodal BISINDO Corpus Annotated Images and V,F,999,0,116,0,0,1115,1115
+A Multimodal BISINDO Corpus Annotated Images and V,G,828,0,69,0,0,897,897
+A Multimodal BISINDO Corpus Annotated Images and V,H,938,0,128,0,0,1066,1066
+A Multimodal BISINDO Corpus Annotated Images and V,I,856,0,80,0,0,936,936
+A Multimodal BISINDO Corpus Annotated Images and V,J,889,0,78,0,0,967,967
+A Multimodal BISINDO Corpus Annotated Images and V,K,832,0,124,0,0,956,956
+A Multimodal BISINDO Corpus Annotated Images and V,L,686,0,71,0,0,757,757
+A Multimodal BISINDO Corpus Annotated Images and V,M,487,0,46,0,0,533,533
+A Multimodal BISINDO Corpus Annotated Images and V,N,357,0,75,0,0,432,432
+A Multimodal BISINDO Corpus Annotated Images and V,O,526,0,46,0,0,572,572
+A Multimodal BISINDO Corpus Annotated Images and V,P,821,0,152,0,0,973,973
+A Multimodal BISINDO Corpus Annotated Images and V,Q,507,0,36,0,0,543,543
+A Multimodal BISINDO Corpus Annotated Images and V,R,127,0,21,0,0,148,148
+A Multimodal BISINDO Corpus Annotated Images and V,S,491,0,38,0,0,529,529
+A Multimodal BISINDO Corpus Annotated Images and V,T,738,0,138,0,0,876,876
+A Multimodal BISINDO Corpus Annotated Images and V,U,518,0,48,0,0,566,566
+A Multimodal BISINDO Corpus Annotated Images and V,UNRESOLVED,0,0,0,8,8,0,8
+A Multimodal BISINDO Corpus Annotated Images and V,V,506,0,41,0,0,547,547
+A Multimodal BISINDO Corpus Annotated Images and V,W,494,0,38,0,0,532,532
+A Multimodal BISINDO Corpus Annotated Images and V,X,457,0,36,0,0,493,493
+A Multimodal BISINDO Corpus Annotated Images and V,Y,450,0,26,0,0,476,476
+A Multimodal BISINDO Corpus Annotated Images and V,Z,297,0,19,0,0,316,316
+BISINDO Video Dataset,Alphabets Image,0,0,0,2107,0,2107,2107
+BISINDO Video Dataset,Alphabets Video Dataset,0,0,0,1,1,0,1
+BISINDO Video Dataset,Family Video Dataset,0,0,0,1,1,0,1
+BISINDO Video Dataset,Introductory Video Dataset,0,0,0,1,1,0,1
+BISINDO Video Dataset,Name-of-the-Day Video Dataset,0,0,0,1,1,0,1
+BISINDO Video Dataset,Numbers Video Dataset,0,0,0,1,1,0,1
+BISINDO Video Dataset,Short Story Video Dataset,0,0,0,1,1,0,1
