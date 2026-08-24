@@ -91,25 +91,113 @@ def get_active_model_version() -> str:
 ACTIVE_MODEL_VERSION = get_active_model_version()
 DEFAULT_MODEL_DIR = MODEL_ROOT / ACTIVE_MODEL_VERSION
 
-DEFAULT_MODEL_PATH = (
-    DEFAULT_MODEL_DIR / "wl_bisindo_hand134_transformer_traced.pt"
+
+@dataclass(frozen=True)
+class RuntimeSpec:
+    version: str
+    name: str
+    runtime: str
+    inference_mode: str
+    model_file: str
+    mean_file: str
+    std_file: str
+    mapping_file: str
+    sequence_length: int
+    feature_dim: int
+    num_classes: int
+
+
+def load_runtime_spec(model_dir: Path, version: str) -> RuntimeSpec:
+    config_path = model_dir / "model_config.json"
+
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    elif version == "v1":
+        cfg = {
+            "name": "WL-BISINDO Hand134 Transformer V4",
+            "runtime": "torchscript",
+            "inference_mode": "sequence",
+            "model_file": "wl_bisindo_hand134_transformer_traced.pt",
+            "mean_file": "feature_mean.npy",
+            "std_file": "feature_std.npy",
+            "mapping_file": "class_mapping.json",
+            "sequence_length": 48,
+            "feature_dim": 134,
+            "num_classes": 32,
+        }
+    elif version == "v2":
+        cfg = {
+            "name": "BISINDO Alphabet Dual-Hand MLP",
+            "runtime": "onnxruntime",
+            "inference_mode": "single_frame",
+            "model_file": "alphabet_model_v7.onnx",
+            "mean_file": "feature_mean_v7.npy",
+            "std_file": "feature_std_v7.npy",
+            "mapping_file": "class_mapping_v7.json",
+            "sequence_length": 1,
+            "feature_dim": 134,
+            "num_classes": 26,
+        }
+    else:
+        raise FileNotFoundError(
+            f"Konfigurasi tidak ditemukan: {config_path}. "
+            "Tambahkan model_config.json untuk versi model baru."
+        )
+
+    required = {
+        "name", "runtime", "inference_mode", "model_file",
+        "mean_file", "std_file", "mapping_file", "sequence_length",
+        "feature_dim", "num_classes",
+    }
+    missing = sorted(required - set(cfg))
+    if missing:
+        raise ValueError(f"model_config.json kurang field: {missing}")
+
+    runtime = str(cfg["runtime"]).lower()
+    mode = str(cfg["inference_mode"]).lower()
+    if runtime not in {"torchscript", "onnxruntime"}:
+        raise ValueError(f"Runtime tidak didukung: {runtime}")
+    if mode not in {"sequence", "single_frame"}:
+        raise ValueError(f"inference_mode tidak didukung: {mode}")
+
+    return RuntimeSpec(
+        version=version,
+        name=str(cfg["name"]),
+        runtime=runtime,
+        inference_mode=mode,
+        model_file=str(cfg["model_file"]),
+        mean_file=str(cfg["mean_file"]),
+        std_file=str(cfg["std_file"]),
+        mapping_file=str(cfg["mapping_file"]),
+        sequence_length=int(cfg["sequence_length"]),
+        feature_dim=int(cfg["feature_dim"]),
+        num_classes=int(cfg["num_classes"]),
+    )
+
+
+RUNTIME_SPEC = load_runtime_spec(
+    DEFAULT_MODEL_DIR,
+    ACTIVE_MODEL_VERSION,
 )
-DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / "feature_mean.npy"
-DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / "feature_std.npy"
-DEFAULT_MAPPING_PATH = DEFAULT_MODEL_DIR / "class_mapping.json"
+
+DEFAULT_MODEL_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.model_file
+DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.mean_file
+DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.std_file
+DEFAULT_MAPPING_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.mapping_file
 
 
 # ============================================================
 # Preprocessing V2 constants — MUST match Kaggle preprocessing
 # ============================================================
 
-SEQ_LEN = 48
+SEQ_LEN = RUNTIME_SPEC.sequence_length
 NUM_HANDS = 2
 NUM_HAND_LANDMARKS = 21
 
 HAND_FEATURES = 67
-FEATURE_DIM = 134
-NUM_CLASSES = 32
+FEATURE_DIM = RUNTIME_SPEC.feature_dim
+NUM_CLASSES = RUNTIME_SPEC.num_classes
 
 LEFT = 0
 RIGHT = 1
@@ -202,27 +290,61 @@ def load_runtime_files(
 
     mapping = load_mapping(mapping_path)
 
-    model = torch.jit.load(
-        str(model_path),
-        map_location=device,
-    ).eval()
+    if RUNTIME_SPEC.runtime == "torchscript":
+        model = torch.jit.load(
+            str(model_path),
+            map_location=device,
+        ).eval()
 
-    # One real shape sanity check.
-    dummy = torch.zeros(
-        1,
-        SEQ_LEN,
-        FEATURE_DIM,
-        dtype=torch.float32,
-        device=device,
-    )
+        dummy_shape = (
+            (1, SEQ_LEN, FEATURE_DIM)
+            if RUNTIME_SPEC.inference_mode == "sequence"
+            else (1, FEATURE_DIM)
+        )
+        dummy = torch.zeros(
+            *dummy_shape,
+            dtype=torch.float32,
+            device=device,
+        )
+        with torch.inference_mode():
+            output = model(dummy)
+        output_shape = tuple(output.shape)
+    else:
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise ImportError(
+                "Model aktif membutuhkan onnxruntime. Jalankan: "
+                "python -m pip install onnxruntime==1.20.1"
+            ) from exc
 
-    with torch.inference_mode():
-        output = model(dummy)
+        providers = ["CPUExecutionProvider"]
+        model = ort.InferenceSession(
+            str(model_path),
+            providers=providers,
+        )
+        input_meta = model.get_inputs()[0]
+        output_meta = model.get_outputs()[0]
+        expected_rank = 3 if RUNTIME_SPEC.inference_mode == "sequence" else 2
+        if len(input_meta.shape) != expected_rank:
+            raise RuntimeError(
+                f"Rank input ONNX harus {expected_rank}, found {input_meta.shape}"
+            )
+        dummy_shape = (
+            (1, SEQ_LEN, FEATURE_DIM)
+            if RUNTIME_SPEC.inference_mode == "sequence"
+            else (1, FEATURE_DIM)
+        )
+        output = model.run(
+            [output_meta.name],
+            {input_meta.name: np.zeros(dummy_shape, dtype=np.float32)},
+        )[0]
+        output_shape = tuple(output.shape)
 
-    if tuple(output.shape) != (1, NUM_CLASSES):
+    if output_shape != (1, NUM_CLASSES):
         raise RuntimeError(
             "Output model tidak sesuai. "
-            f"Expected (1,{NUM_CLASSES}), found {tuple(output.shape)}"
+            f"Expected (1,{NUM_CLASSES}), found {output_shape}"
         )
 
     return model, feature_mean, feature_std, mapping
@@ -1058,29 +1180,123 @@ def build_hand134_sequence(
     return x, quality
 
 
+def assign_candidates_for_static_model(candidates):
+    """Match Training A V7: use MediaPipe's raw handedness slots."""
+    assigned = {LEFT: None, RIGHT: None}
+    scores = {LEFT: -1.0, RIGHT: -1.0}
+
+    for candidate in candidates:
+        label = str(candidate.get("handedness_label") or "").lower()
+        score = float(candidate.get("handedness_score", 0.0))
+        if label == "left":
+            side = LEFT
+        elif label == "right":
+            side = RIGHT
+        else:
+            continue
+
+        if score > scores[side]:
+            assigned[side] = candidate["arr"]
+            scores[side] = score
+
+    # Rare fallback when handedness is unavailable.
+    unassigned = [c for c in candidates if str(c.get("handedness_label") or "").lower() not in {"left", "right"}]
+    for candidate in unassigned:
+        free = LEFT if assigned[LEFT] is None else RIGHT
+        if assigned[free] is None:
+            assigned[free] = candidate["arr"]
+
+    return assigned
+
+
+def static_v2_hand_feature(hand_arr):
+    """Exact 67-D hand feature used by BISINDO Training A V7."""
+    if hand_arr is None or not np.isfinite(hand_arr).all():
+        return np.zeros(HAND_FEATURES, dtype=np.float32)
+
+    points = np.asarray(hand_arr, dtype=np.float32)
+    points = points - points[0:1]
+
+    palm_scale = float(np.linalg.norm(points[9, :2]))
+    if palm_scale < 1e-5:
+        palm_scale = float(
+            np.max(np.linalg.norm(points[:, :2], axis=1))
+        )
+    palm_scale = max(palm_scale, 1e-3)
+    normalized = np.clip(points / palm_scale, -5.0, 5.0)
+
+    palm_span = np.linalg.norm(
+        normalized[5, :2] - normalized[17, :2]
+    )
+    hand_length = np.linalg.norm(normalized[12, :2])
+    fingertip_spread = np.mean([
+        np.linalg.norm(normalized[4, :2] - normalized[8, :2]),
+        np.linalg.norm(normalized[8, :2] - normalized[12, :2]),
+        np.linalg.norm(normalized[12, :2] - normalized[16, :2]),
+        np.linalg.norm(normalized[16, :2] - normalized[20, :2]),
+    ])
+
+    return np.concatenate([
+        normalized.reshape(-1),
+        np.asarray(
+            [palm_span, hand_length, fingertip_spread],
+            dtype=np.float32,
+        ),
+        np.ones(1, dtype=np.float32),
+    ]).astype(np.float32)
+
+
+def build_static_hand134(candidates, feature_mean, feature_std):
+    assigned = assign_candidates_for_static_model(candidates)
+    left = static_v2_hand_feature(assigned[LEFT])
+    right = static_v2_hand_feature(assigned[RIGHT])
+    feature = np.concatenate([left, right]).astype(np.float32)
+    normalized = ((feature - feature_mean) / feature_std).astype(np.float32)
+
+    detected = int(left[LEFT_PRESENCE_IDX] > 0.5) + int(
+        right[LEFT_PRESENCE_IDX] > 0.5
+    )
+    quality = {
+        "observed_any": float(detected > 0),
+        "valid_any": float(detected > 0),
+        "left_valid": float(left[LEFT_PRESENCE_IDX] > 0.5),
+        "right_valid": float(right[LEFT_PRESENCE_IDX] > 0.5),
+    }
+    return normalized, quality
+
+
 # ============================================================
 # Model inference
 # ============================================================
 
-@torch.inference_mode()
 def predict_sequence(
     model,
     sequence,
     device,
 ):
-    x = torch.from_numpy(
-        sequence
-    ).unsqueeze(0).to(
-        device,
-        non_blocking=True,
+    if RUNTIME_SPEC.runtime == "torchscript":
+        x = torch.from_numpy(
+            sequence
+        ).unsqueeze(0).to(
+            device,
+            non_blocking=True,
+        )
+        with torch.inference_mode():
+            logits = model(x)
+            probs_np = torch.softmax(logits, dim=1)[0].cpu().numpy()
+    else:
+        input_meta = model.get_inputs()[0]
+        logits_np = model.run(
+            None,
+            {input_meta.name: sequence[None, ...].astype(np.float32)},
+        )[0][0]
+        shifted = logits_np - np.max(logits_np)
+        exp_values = np.exp(shifted)
+        probs_np = exp_values / np.sum(exp_values)
+
+    probs = torch.from_numpy(
+        np.asarray(probs_np, dtype=np.float32)
     )
-
-    logits = model(x)
-
-    probs = torch.softmax(
-        logits,
-        dim=1,
-    )[0]
 
     top_k = min(
         2,
@@ -1488,7 +1704,7 @@ def run(args):
 
     print("=" * 72)
     print(
-        "WL-BISINDO HAND134 TRANSFORMER V4 — FAST CONTINUOUS"
+        f"{RUNTIME_SPEC.name} — FAST CONTINUOUS"
     )
     print("=" * 72)
     print(
@@ -1501,8 +1717,10 @@ def run(args):
     )
     print(
         "Device         :",
-        device,
+        device if RUNTIME_SPEC.runtime == "torchscript" else "onnxruntime-cpu",
     )
+    print("Runtime        :", RUNTIME_SPEC.runtime)
+    print("Inference mode :", RUNTIME_SPEC.inference_mode)
 
     if device.type == "cuda":
         print(
@@ -1514,7 +1732,11 @@ def run(args):
 
     print(
         "Input model    :",
-        f"{SEQ_LEN} x {FEATURE_DIM}",
+        (
+            f"{SEQ_LEN} x {FEATURE_DIM}"
+            if RUNTIME_SPEC.inference_mode == "sequence"
+            else f"{FEATURE_DIM} (single frame)"
+        ),
     )
     print(
         "Threshold      :",
@@ -1560,17 +1782,37 @@ def run(args):
             args.camera
         )
 
-        if os.name == "nt":
-            cap = cv2.VideoCapture(
-                source,
-                cv2.CAP_DSHOW,
-            )
-        else:
-            cap = cv2.VideoCapture(
-                source
+        cap = None
+        camera_attempts = []
+        backends = (
+            [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+            if os.name == "nt"
+            else [cv2.CAP_ANY]
+        )
+        camera_ids = [source] + [i for i in range(3) if i != source]
+        for camera_id in camera_ids:
+            for backend in backends:
+                candidate_cap = cv2.VideoCapture(camera_id, backend)
+                camera_attempts.append((camera_id, backend))
+                if candidate_cap.isOpened():
+                    ok_probe, _ = candidate_cap.read()
+                    if ok_probe:
+                        cap = candidate_cap
+                        source = camera_id
+                        print(f"[CAMERA] Opened index {camera_id}, backend {backend}")
+                        break
+                candidate_cap.release()
+            if cap is not None:
+                break
+
+        if cap is None:
+            raise RuntimeError(
+                "Tidak bisa membuka kamera. Sudah mencoba indeks 0-2 "
+                "dengan DirectShow/MSMF/Default. Pastikan kamera terpasang, "
+                "izin Windows aktif, dan tidak dipakai aplikasi lain."
             )
 
-    if not cap.isOpened():
+    if cap is None or not cap.isOpened():
         raise RuntimeError(
             f"Tidak bisa membuka input: {source}"
         )
@@ -1651,6 +1893,10 @@ def run(args):
     print(" R       : reset temporal state")
     print()
 
+    static_single_frame = (
+        RUNTIME_SPEC.inference_mode == "single_frame"
+    )
+
     with mp_pose.Pose(
         static_image_mode=False,
         model_complexity=0,
@@ -1659,9 +1905,9 @@ def run(args):
         min_detection_confidence=0.40,
         min_tracking_confidence=0.40,
     ) as pose, mp_hands.Hands(
-        static_image_mode=False,
+        static_image_mode=static_single_frame,
         max_num_hands=2,
-        model_complexity=0,
+        model_complexity=(1 if static_single_frame else 0),
         min_detection_confidence=FULL_HAND_DET_CONF,
         min_tracking_confidence=FULL_HAND_TRACK_CONF,
     ) as hands, mp_hands.Hands(
@@ -1825,21 +2071,28 @@ def run(args):
                 )
 
                 can_infer = (
-                    len(raw_window) == SEQ_LEN
+                    (
+                        RUNTIME_SPEC.inference_mode == "single_frame"
+                        or len(raw_window) == SEQ_LEN
+                    )
                     and frame_id
                     % args.infer_every
                     == 0
                 )
 
                 if can_infer:
-                    (
-                        sequence,
-                        quality,
-                    ) = build_hand134_sequence(
-                        raw_window,
-                        feature_mean,
-                        feature_std,
-                    )
+                    if RUNTIME_SPEC.inference_mode == "single_frame":
+                        sequence, quality = build_static_hand134(
+                            candidates,
+                            feature_mean,
+                            feature_std,
+                        )
+                    else:
+                        sequence, quality = build_hand134_sequence(
+                            raw_window,
+                            feature_mean,
+                            feature_std,
+                        )
 
                     (
                         pred_id,

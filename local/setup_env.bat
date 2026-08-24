@@ -38,6 +38,7 @@ if errorlevel 1 goto :error
 echo [5/6] Menyiapkan model registry lokal...
 if not exist "models" mkdir models
 if not exist "models\v1" mkdir models\v1
+if not exist "models\v2" mkdir models\v2
 
 if not exist "active_model.txt" (
     echo v1>active_model.txt
@@ -57,9 +58,10 @@ echo   active_model.txt
 echo.
 echo Contoh isi:
 echo   v1
+echo   v2
 echo.
 echo File model harus berada di:
-echo   models\v1\
+echo   models\VERSI\
 echo.
 pause
 exit /b 0

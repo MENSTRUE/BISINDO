@@ -1,0 +1,37 @@
+WL-BISINDO DYNAMIC MODEL SELECTOR
+=================================
+
+1. Timpa file berikut di folder local:
+   - realtime_bisindo.py
+   - check_setup.py
+   - requirements.txt
+   - run.bat
+   - setup_env.bat
+
+2. Salin model_config.json ke folder model masing-masing:
+   - models/v1/model_config.json
+   - models/v2/model_config.json
+
+3. Pastikan models/v1 berisi:
+   - wl_bisindo_hand134_transformer_traced.pt
+   - feature_mean.npy
+   - feature_std.npy
+   - class_mapping.json
+
+4. Pastikan models/v2 berisi:
+   - alphabet_model_v7.onnx
+   - feature_mean_v7.npy
+   - feature_std_v7.npy
+   - class_mapping_v7.json
+
+5. Sekali saja, instal dependency baru:
+   .\.venv\Scripts\python.exe -m pip install onnxruntime==1.20.1
+
+6. Pilih model hanya melalui active_model.txt:
+   v1 = Transformer sequence 48x134, 32 kelas
+   v2 = ONNX single-frame 134-D, 26 kelas A-Z
+
+7. Jalankan:
+   .\run.bat
+
+Tidak perlu mengganti nama file model atau mengedit Python saat berpindah v1/v2.

@@ -1,0 +1,12 @@
+{
+  "name": "BISINDO Alphabet Dual-Hand MLP — Training A V7",
+  "runtime": "onnxruntime",
+  "inference_mode": "single_frame",
+  "model_file": "alphabet_model_v7.onnx",
+  "mean_file": "feature_mean_v7.npy",
+  "std_file": "feature_std_v7.npy",
+  "mapping_file": "class_mapping_v7.json",
+  "sequence_length": 1,
+  "feature_dim": 134,
+  "num_classes": 26
+}
