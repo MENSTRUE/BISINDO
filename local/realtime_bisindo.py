@@ -2640,6 +2640,76 @@ def draw_hand_points(
         )
 
 
+
+def draw_feature_points(
+    frame,
+    coords,
+    valid_mask,
+    color,
+    radius=4,
+):
+    """Draw normalized xyz landmark coordinates as DOTS ONLY.
+
+    No skeleton lines are drawn. This is intentionally only a visual
+    diagnostic so the webcam preview reflects which non-hand landmarks
+    are being fed into the multimodal model.
+    """
+    if coords is None or valid_mask is None:
+        return
+
+    coords = np.asarray(coords)
+    valid_mask = np.asarray(valid_mask).astype(bool)
+
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        return
+
+    h, w = frame.shape[:2]
+
+    for i, p in enumerate(coords):
+        if i >= len(valid_mask) or not valid_mask[i]:
+            continue
+
+        if not np.isfinite(p[:2]).all():
+            continue
+
+        x = int(
+            np.clip(
+                p[0],
+                0.0,
+                1.0,
+            )
+            * w
+        )
+
+        y = int(
+            np.clip(
+                p[1],
+                0.0,
+                1.0,
+            )
+            * h
+        )
+
+        # Small dark outline makes the dot readable on bright backgrounds.
+        cv2.circle(
+            frame,
+            (x, y),
+            radius + 1,
+            (0, 0, 0),
+            -1,
+            cv2.LINE_AA,
+        )
+
+        cv2.circle(
+            frame,
+            (x, y),
+            radius,
+            color,
+            -1,
+            cv2.LINE_AA,
+        )
+
+
 def put_line(
     frame,
     text,
@@ -3440,6 +3510,35 @@ def run(args):
                     (255, 0, 255),
                 )
 
+                # --------------------------------------------------
+                # MULTIMODAL VISUALIZATION — DOTS ONLY, NO LINES
+                # --------------------------------------------------
+                # IMPORTANT:
+                # These body/face dots are shown only when the active
+                # deployment is the multimodal word model. Alphabet v2
+                # remains hand-only and therefore will not misleadingly
+                # display body/face as model inputs.
+                if RUNTIME_SPEC.kind == "multimodal":
+                    # Upper-body/head Pose36:
+                    # nose, shoulders, elbows, wrists, hips.
+                    draw_feature_points(
+                        vis,
+                        pose_coords,
+                        pose_point_valid,
+                        (255, 255, 0),   # cyan in BGR
+                        radius=5,
+                    )
+
+                    # FaceHead52 source points:
+                    # nose, eyes, ears, mouth corners.
+                    draw_feature_points(
+                        vis,
+                        face_coords,
+                        face_point_valid,
+                        (0, 255, 255),   # yellow in BGR
+                        radius=3,
+                    )
+
                 # Mirror DISPLAY only.
                 if not args.no_mirror:
                     vis = cv2.flip(
@@ -3491,7 +3590,7 @@ def run(args):
                 )
                 panel_y1 = min(
                     vis.shape[0] - 10,
-                    232,
+                    260,
                 )
 
                 draw_translucent_panel(
@@ -3591,6 +3690,37 @@ def run(args):
                         f"TTS {'ON' if tts.enabled else 'OFF'}"
                     ),
                     216,
+                    0.41,
+                    1,
+                    20,
+                )
+
+                if RUNTIME_SPEC.kind == "multimodal":
+                    body_now = int(
+                        np.asarray(
+                            pose_point_valid,
+                            dtype=np.uint8,
+                        ).sum()
+                    )
+
+                    face_now = int(
+                        np.asarray(
+                            face_point_valid,
+                            dtype=np.uint8,
+                        ).sum()
+                    )
+
+                    feature_text = (
+                        f"INPUT C: HAND + BODY {body_now}/9 + "
+                        f"FACE/HEAD {face_now}/11 | dots only"
+                    )
+                else:
+                    feature_text = "INPUT: HAND134 only"
+
+                put_line(
+                    vis,
+                    feature_text,
+                    242,
                     0.41,
                     1,
                     20,
