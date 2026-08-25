@@ -37,12 +37,14 @@ def default_config(version):
             "feature_dim": 134, "num_classes": 32,
         }
     if version == "v2":
+        # Current alphabet deployment: V8.4 temporal Transformer.
+        # models/v2/model_config.json still has priority when present.
         return {
-            "name": "BISINDO Alphabet Dual-Hand MLP",
-            "runtime": "onnxruntime", "inference_mode": "single_frame",
-            "model_file": "alphabet_model_v7.onnx",
-            "mean_file": "feature_mean_v7.npy", "std_file": "feature_std_v7.npy",
-            "mapping_file": "class_mapping_v7.json", "sequence_length": 1,
+            "name": "BISINDO Alphabet V8.4 Temporal Transformer",
+            "runtime": "torchscript", "inference_mode": "sequence",
+            "model_file": "alphabet_temporal_v8_4_traced.pt",
+            "mean_file": "feature_mean_v8_4.npy", "std_file": "feature_std_v8_4.npy",
+            "mapping_file": "class_mapping_v8_4.json", "sequence_length": 48,
             "feature_dim": 134, "num_classes": 26,
         }
     raise FileNotFoundError(
@@ -85,6 +87,17 @@ print("Expected output:", f"1 x {num_classes}")
 
 errors = []
 warnings = []
+
+if active_version == "v2":
+    if runtime != "torchscript" or mode != "sequence":
+        warnings.append(
+            "v2 saat ini seharusnya V8.4 torchscript/sequence. "
+            "Cek models/v2/model_config.json jika masih menunjuk V7 ONNX."
+        )
+    if sequence_length != 48 or feature_dim != 134 or num_classes != 26:
+        warnings.append(
+            "Konfigurasi v2 tidak sama dengan V8.4 expected 48x134 -> 26 kelas."
+        )
 
 try:
     import numpy as np

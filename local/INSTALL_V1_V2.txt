@@ -1,37 +1,32 @@
-WL-BISINDO DYNAMIC MODEL SELECTOR
-=================================
+WL-BISINDO DYNAMIC MODEL SELECTOR — UPDATED V8.4
+================================================
 
-1. Timpa file berikut di folder local:
-   - realtime_bisindo.py
-   - check_setup.py
-   - requirements.txt
-   - run.bat
-   - setup_env.bat
+1. models/v1 = model perkata (TorchScript sequence 48x134, 32 kelas)
+2. models/v2 = alphabet V8.4 (TorchScript sequence 48x134, 26 kelas A-Z)
 
-2. Salin model_config.json ke folder model masing-masing:
-   - models/v1/model_config.json
-   - models/v2/model_config.json
+models/v2 wajib berisi:
+- alphabet_temporal_v8_4_traced.pt
+- feature_mean_v8_4.npy
+- feature_std_v8_4.npy
+- class_mapping_v8_4.json
+- model_config.json
+- recommended_realtime_v8_4.json
+- metrics_v8_4.json (opsional runtime)
 
-3. Pastikan models/v1 berisi:
-   - wl_bisindo_hand134_transformer_traced.pt
-   - feature_mean.npy
-   - feature_std.npy
-   - class_mapping.json
+Pilih model melalui active_model.txt:
+- v1 = kata
+- v2 = alphabet V8.4
 
-4. Pastikan models/v2 berisi:
-   - alphabet_model_v7.onnx
-   - feature_mean_v7.npy
-   - feature_std_v7.npy
-   - class_mapping_v7.json
+Untuk alphabet sekarang isi active_model.txt:
+v2
 
-5. Sekali saja, instal dependency baru:
-   .\.venv\Scripts\python.exe -m pip install onnxruntime==1.20.1
+Jalankan:
+.\run.bat
 
-6. Pilih model hanya melalui active_model.txt:
-   v1 = Transformer sequence 48x134, 32 kelas
-   v2 = ONNX single-frame 134-D, 26 kelas A-Z
+Startup v2 yang benar:
+Runtime        : torchscript
+Inference mode : sequence
+Expected input : 1 x 48 x 134
+Expected output: 1 x 26
 
-7. Jalankan:
-   .\run.bat
-
-Tidak perlu mengganti nama file model atau mengedit Python saat berpindah v1/v2.
+V7 ONNX single-frame SUDAH BUKAN deployment alphabet utama.

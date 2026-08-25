@@ -127,15 +127,17 @@ def load_runtime_spec(model_dir: Path, version: str) -> RuntimeSpec:
             "num_classes": 32,
         }
     elif version == "v2":
+        # V8.4 alphabet deployment. model_config.json in models/v2/ still
+        # has priority, but this fallback now matches the current model.
         cfg = {
-            "name": "BISINDO Alphabet Dual-Hand MLP",
-            "runtime": "onnxruntime",
-            "inference_mode": "single_frame",
-            "model_file": "alphabet_model_v7.onnx",
-            "mean_file": "feature_mean_v7.npy",
-            "std_file": "feature_std_v7.npy",
-            "mapping_file": "class_mapping_v7.json",
-            "sequence_length": 1,
+            "name": "BISINDO Alphabet V8.4 Temporal Transformer",
+            "runtime": "torchscript",
+            "inference_mode": "sequence",
+            "model_file": "alphabet_temporal_v8_4_traced.pt",
+            "mean_file": "feature_mean_v8_4.npy",
+            "std_file": "feature_std_v8_4.npy",
+            "mapping_file": "class_mapping_v8_4.json",
+            "sequence_length": 48,
             "feature_dim": 134,
             "num_classes": 26,
         }
@@ -217,6 +219,95 @@ POSE_VIS_THRESHOLD = 0.25
 FULL_HAND_DET_CONF = 0.30
 FULL_HAND_TRACK_CONF = 0.30
 RECOVERY_DET_CONF = 0.20
+
+# Low-light / backlight fallback. This only changes pixels seen by
+# MediaPipe; landmark coordinates and Hand134 math stay unchanged.
+FALLBACK_HAND_DET_CONF = 0.15
+DETECTOR_CLAHE_CLIP = 2.0
+DETECTOR_DARK_CENTER_MEAN = 92.0
+DETECTOR_LOW_P10 = 34.0
+
+
+# ============================================================
+# Detector-only photometric robustness
+# ============================================================
+
+def prepare_detector_frame(frame, enabled=True):
+    """
+    Improve dark/backlit webcam frames for MediaPipe only.
+
+    IMPORTANT:
+    - Display still uses the original camera frame.
+    - No geometry is changed (no resize/crop/flip here).
+    - Therefore Hand134 coordinates keep the same coordinate system.
+    """
+    if not enabled:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        cy0, cy1 = int(h * 0.18), int(h * 0.88)
+        cx0, cx1 = int(w * 0.18), int(w * 0.82)
+        center = gray[cy0:cy1, cx0:cx1]
+        stats = {
+            "center_mean": float(center.mean()) if center.size else float(gray.mean()),
+            "p10": float(np.percentile(gray, 10)),
+            "p90": float(np.percentile(gray, 90)),
+            "enhanced": False,
+        }
+        return frame, False, stats
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    cy0, cy1 = int(h * 0.18), int(h * 0.88)
+    cx0, cx1 = int(w * 0.18), int(w * 0.82)
+    center = gray[cy0:cy1, cx0:cx1]
+
+    center_mean = float(center.mean()) if center.size else float(gray.mean())
+    p10 = float(np.percentile(gray, 10))
+    p90 = float(np.percentile(gray, 90))
+
+    # Strong window/backlight usually produces a dark person in the center
+    # even when the global image mean looks acceptable.
+    should_enhance = (
+        center_mean < DETECTOR_DARK_CENTER_MEAN
+        or p10 < DETECTOR_LOW_P10
+        or (p90 - p10) > 155.0
+    )
+
+    if not should_enhance:
+        return frame, False, {
+            "center_mean": center_mean,
+            "p10": p10,
+            "p90": p90,
+            "enhanced": False,
+        }
+
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+    clahe = cv2.createCLAHE(
+        clipLimit=DETECTOR_CLAHE_CLIP,
+        tileGridSize=(8, 8),
+    )
+    l_chan = clahe.apply(l_chan)
+    enhanced = cv2.cvtColor(
+        cv2.merge((l_chan, a_chan, b_chan)),
+        cv2.COLOR_LAB2BGR,
+    )
+
+    # Mild gamma lift only when the central subject is very dark.
+    if center_mean < 70.0:
+        gamma = 0.72
+        lut = np.array(
+            [((i / 255.0) ** gamma) * 255.0 for i in range(256)],
+            dtype=np.uint8,
+        )
+        enhanced = cv2.LUT(enhanced, lut)
+
+    return enhanced, True, {
+        "center_mean": center_mean,
+        "p10": p10,
+        "p90": p90,
+        "enhanced": True,
+    }
 
 
 # ============================================================
@@ -735,8 +826,13 @@ def recover_hand_from_roi(
         y1,
     ) = roi
 
-    crop_rgb = cv2.cvtColor(
+    detector_crop, _, _ = prepare_detector_frame(
         crop,
+        enabled=True,
+    )
+
+    crop_rgb = cv2.cvtColor(
+        detector_crop,
         cv2.COLOR_BGR2RGB,
     )
 
@@ -1756,6 +1852,14 @@ def run(args):
         "frame",
     )
     print(
+        "Detector enhance:",
+        "ON" if args.detector_enhance else "OFF",
+    )
+    print(
+        "Detector fallback:",
+        "ON" if args.detector_fallback else "OFF",
+    )
+    print(
         "IMPORTANT      :",
         "tidak perlu tangan keluar frame",
     )
@@ -1868,12 +1972,23 @@ def run(args):
         "right_valid": 0.0,
     }
 
+    detector_info = {
+        "pose": False,
+        "primary_hands": 0,
+        "fallback_hands": 0,
+        "left_now": False,
+        "right_now": False,
+        "enhanced": False,
+        "center_mean": 0.0,
+    }
+    no_hand_streak = 0
+
     fps_samples = deque(
         maxlen=30
     )
     last_loop = time.perf_counter()
 
-    WINDOW_NAME = "WL-BISINDO Hand134 Realtime"
+    WINDOW_NAME = f"BISINDO Realtime — {ACTIVE_MODEL_VERSION}"
 
     # Keep the OpenCV window attached to the actual camera frame size.
     # WINDOW_AUTOSIZE prevents a maximized/resized window from leaving
@@ -1902,8 +2017,8 @@ def run(args):
         model_complexity=0,
         smooth_landmarks=True,
         enable_segmentation=False,
-        min_detection_confidence=0.40,
-        min_tracking_confidence=0.40,
+        min_detection_confidence=0.30,
+        min_tracking_confidence=0.30,
     ) as pose, mp_hands.Hands(
         static_image_mode=static_single_frame,
         max_num_hands=2,
@@ -1911,6 +2026,11 @@ def run(args):
         min_detection_confidence=FULL_HAND_DET_CONF,
         min_tracking_confidence=FULL_HAND_TRACK_CONF,
     ) as hands, mp_hands.Hands(
+        static_image_mode=True,
+        max_num_hands=2,
+        model_complexity=0,
+        min_detection_confidence=FALLBACK_HAND_DET_CONF,
+    ) as fallback_hands, mp_hands.Hands(
         static_image_mode=True,
         max_num_hands=1,
         model_complexity=0,
@@ -1935,9 +2055,18 @@ def run(args):
 
                 frame_id += 1
 
-                # Inference uses ORIGINAL frame, not mirrored display.
+                # Detector input may be photometrically enhanced for dark /
+                # backlit webcams. Geometry is unchanged and display remains
+                # the original frame.
+                detector_frame, enhanced_used, light_stats = (
+                    prepare_detector_frame(
+                        frame,
+                        enabled=args.detector_enhance,
+                    )
+                )
+
                 rgb = cv2.cvtColor(
-                    frame,
+                    detector_frame,
                     cv2.COLOR_BGR2RGB,
                 )
                 rgb.flags.writeable = False
@@ -1959,10 +2088,47 @@ def run(args):
                     pose_result
                 )
 
-                candidates = (
+                primary_candidates = (
                     collect_full_hand_candidates(
                         hand_result
                     )
+                )
+                candidates = primary_candidates
+                fallback_count = 0
+
+                # A separate static-image detector is only invoked when the
+                # tracking detector finds nothing. This is intentionally
+                # lower-threshold and helps with first acquisition / low light.
+                if (
+                    len(candidates) == 0
+                    and args.detector_fallback
+                ):
+                    fallback_result = fallback_hands.process(
+                        rgb
+                    )
+                    fallback_candidates = (
+                        collect_full_hand_candidates(
+                            fallback_result
+                        )
+                    )
+                    fallback_count = len(
+                        fallback_candidates
+                    )
+                    if fallback_candidates:
+                        candidates = fallback_candidates
+
+                detector_info["pose"] = bool(
+                    pvalid > 0.5
+                )
+                detector_info["primary_hands"] = len(
+                    primary_candidates
+                )
+                detector_info["fallback_hands"] = fallback_count
+                detector_info["enhanced"] = bool(
+                    enhanced_used
+                )
+                detector_info["center_mean"] = float(
+                    light_stats["center_mean"]
                 )
 
                 assigned = (
@@ -2055,6 +2221,30 @@ def run(args):
                             0,
                         ].copy()
                     )
+
+                detector_info["left_now"] = bool(
+                    np.isfinite(tracks[LEFT]).all()
+                )
+                detector_info["right_now"] = bool(
+                    np.isfinite(tracks[RIGHT]).all()
+                )
+
+                if (
+                    detector_info["left_now"]
+                    or detector_info["right_now"]
+                ):
+                    no_hand_streak = 0
+                else:
+                    no_hand_streak += 1
+                    if no_hand_streak % 30 == 0:
+                        print(
+                            "[DETECT] no hand | "
+                            f"pose={int(detector_info['pose'])} | "
+                            f"primary={detector_info['primary_hands']} | "
+                            f"fallback={detector_info['fallback_hands']} | "
+                            f"center_luma={detector_info['center_mean']:.1f} | "
+                            f"enhanced={detector_info['enhanced']}"
+                        )
 
                 raw_window.append(
                     FrameState(
@@ -2317,10 +2507,8 @@ def run(args):
                     )
 
                 # --------------------------------------------------
-                # Compact UI
+                # Compact UI + detector diagnostics
                 # --------------------------------------------------
-                # Do not show a random class as if it were recognized
-                # when hand validity/confidence is still poor.
                 if len(raw_window) < SEQ_LEN:
                     status_text = (
                         f"Menyiapkan buffer "
@@ -2358,9 +2546,12 @@ def run(args):
                 panel_y0 = 10
                 panel_x1 = min(
                     vis.shape[1] - 10,
-                    590,
+                    720,
                 )
-                panel_y1 = 158
+                panel_y1 = min(
+                    vis.shape[0] - 10,
+                    232,
+                )
 
                 draw_translucent_panel(
                     vis,
@@ -2368,14 +2559,14 @@ def run(args):
                     panel_y0,
                     panel_x1,
                     panel_y1,
-                    alpha=0.58,
+                    alpha=0.60,
                 )
 
                 put_line(
                     vis,
                     f"Status: {status_text}",
-                    38,
-                    0.58,
+                    34,
+                    0.56,
                     2,
                     20,
                 )
@@ -2383,8 +2574,8 @@ def run(args):
                 put_line(
                     vis,
                     f"Kandidat: {candidate_text}",
-                    66,
-                    0.48,
+                    60,
+                    0.46,
                     1,
                     20,
                 )
@@ -2392,8 +2583,8 @@ def run(args):
                 put_line(
                     vis,
                     f"Terdeteksi: {accepted_text}",
-                    96,
-                    0.60,
+                    86,
+                    0.56,
                     2,
                     20,
                 )
@@ -2401,8 +2592,8 @@ def run(args):
                 put_line(
                     vis,
                     f"Teks: {text_line}",
-                    124,
-                    0.50,
+                    112,
+                    0.46,
                     1,
                     20,
                 )
@@ -2410,12 +2601,56 @@ def run(args):
                 put_line(
                     vis,
                     (
-                        f"Valid {quality['valid_any']:.0%} | "
+                        f"Model {ACTIVE_MODEL_VERSION} | "
+                        f"{RUNTIME_SPEC.runtime}/{RUNTIME_SPEC.inference_mode} | "
+                        f"Buffer {len(raw_window)}/{SEQ_LEN}"
+                    ),
+                    138,
+                    0.41,
+                    1,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    (
+                        f"Pose {'YES' if detector_info['pose'] else 'NO'} | "
+                        f"Hand L {'YES' if detector_info['left_now'] else 'NO'} "
+                        f"R {'YES' if detector_info['right_now'] else 'NO'} | "
+                        f"P/F {detector_info['primary_hands']}/"
+                        f"{detector_info['fallback_hands']}"
+                    ),
+                    164,
+                    0.41,
+                    1,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    (
+                        f"Valid {quality['valid_any']:.0%} "
+                        f"L {quality['left_valid']:.0%} "
+                        f"R {quality['right_valid']:.0%} | "
+                        f"Light {detector_info['center_mean']:.0f} "
+                        f"{'ENH' if detector_info['enhanced'] else 'RAW'}"
+                    ),
+                    190,
+                    0.41,
+                    1,
+                    20,
+                )
+
+                put_line(
+                    vis,
+                    (
+                        f"Conf {current_conf:.2f} | "
+                        f"Margin {current_margin:.2f} | "
                         f"FPS {fps:.1f} | "
                         f"TTS {'ON' if tts.enabled else 'OFF'}"
                     ),
-                    150,
-                    0.43,
+                    216,
+                    0.41,
                     1,
                     20,
                 )
@@ -2635,6 +2870,24 @@ def build_parser():
         "--cpu",
         action="store_true",
     )
+    parser.add_argument(
+        "--detector-enhance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Aktifkan CLAHE/gamma detector-only untuk webcam gelap/backlight."
+        ),
+    )
+    parser.add_argument(
+        "--detector-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Gunakan static low-threshold MediaPipe Hands bila tracker utama "
+            "tidak menemukan tangan."
+        ),
+    )
+
     parser.add_argument(
         "--no-mirror",
         action="store_true",

@@ -1,0 +1,10 @@
+{
+  "warning": "One source video/signer; intra-source temporal sanity check only.",
+  "best_seed": 42,
+  "best_epoch": 5,
+  "best_val_macro_f1": 1.0,
+  "test_accuracy": 0.9807692307692307,
+  "test_macro_f1": 0.9794871794871796,
+  "all_sequences": 338,
+  "mean_any_hand_rate": 0.930103550295858
+}
