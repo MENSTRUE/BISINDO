@@ -98,96 +98,138 @@ class RuntimeSpec:
     name: str
     runtime: str
     inference_mode: str
+    kind: str
     model_file: str
-    mean_file: str
-    std_file: str
     mapping_file: str
     sequence_length: int
-    feature_dim: int
     num_classes: int
+    feature_dim: int = 134
+    winner_mode: str | None = None
 
 
 def load_runtime_spec(model_dir: Path, version: str) -> RuntimeSpec:
-    config_path = model_dir / "model_config.json"
+    """Auto-detect current deployment package.
 
-    if config_path.exists():
-        with config_path.open("r", encoding="utf-8") as f:
+    Priority:
+    1) deployment_config.json from Multimodal A/B/C/D training
+    2) model_config.json from legacy / alphabet deployments
+    3) conservative legacy fallback
+    """
+    deployment_path = model_dir / "deployment_config.json"
+    model_config_path = model_dir / "model_config.json"
+
+    if deployment_path.exists():
+        with deployment_path.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
-    elif version == "v1":
-        cfg = {
-            "name": "WL-BISINDO Hand134 Transformer V4",
-            "runtime": "torchscript",
-            "inference_mode": "sequence",
-            "model_file": "wl_bisindo_hand134_transformer_traced.pt",
-            "mean_file": "feature_mean.npy",
-            "std_file": "feature_std.npy",
-            "mapping_file": "class_mapping.json",
-            "sequence_length": 48,
-            "feature_dim": 134,
-            "num_classes": 32,
-        }
-    elif version == "v2":
-        # V8.4 alphabet deployment. model_config.json in models/v2/ still
-        # has priority, but this fallback now matches the current model.
-        cfg = {
-            "name": "BISINDO Alphabet V8.4 Temporal Transformer",
-            "runtime": "torchscript",
-            "inference_mode": "sequence",
-            "model_file": "alphabet_temporal_v8_4_traced.pt",
-            "mean_file": "feature_mean_v8_4.npy",
-            "std_file": "feature_std_v8_4.npy",
-            "mapping_file": "class_mapping_v8_4.json",
-            "sequence_length": 48,
-            "feature_dim": 134,
-            "num_classes": 26,
-        }
-    else:
-        raise FileNotFoundError(
-            f"Konfigurasi tidak ditemukan: {config_path}. "
-            "Tambahkan model_config.json untuk versi model baru."
+
+        inputs = cfg.get("inputs", {})
+        hand_shape = inputs.get("hand", [1, 48, 134])
+        pose_shape = inputs.get("pose", [1, 48, 36])
+        face_shape = inputs.get("facehead", [1, 48, 52])
+        crop_shape = inputs.get("facecrop", [1, 48, 48, 48])
+
+        if list(hand_shape) != [1, 48, 134]:
+            raise ValueError(f"deployment_config hand input tidak sesuai: {hand_shape}")
+        if list(pose_shape) != [1, 48, 36]:
+            raise ValueError(f"deployment_config pose input tidak sesuai: {pose_shape}")
+        if list(face_shape) != [1, 48, 52]:
+            raise ValueError(f"deployment_config facehead input tidak sesuai: {face_shape}")
+        if list(crop_shape) != [1, 48, 48, 48]:
+            raise ValueError(f"deployment_config facecrop input tidak sesuai: {crop_shape}")
+
+        return RuntimeSpec(
+            version=version,
+            name=str(cfg.get("name", "WL-BISINDO Multimodal Temporal Transformer")),
+            runtime=str(cfg.get("runtime", "torchscript")).lower(),
+            inference_mode="sequence",
+            kind="multimodal",
+            model_file=str(cfg.get("model_file", "wl_bisindo_multimodal_traced.pt")),
+            mapping_file="class_mapping.json",
+            sequence_length=int(cfg.get("sequence_length", 48)),
+            num_classes=int(cfg.get("num_classes", 32)),
+            feature_dim=134,
+            winner_mode=str(cfg.get("winner_mode", "C")),
         )
 
-    required = {
-        "name", "runtime", "inference_mode", "model_file",
-        "mean_file", "std_file", "mapping_file", "sequence_length",
-        "feature_dim", "num_classes",
-    }
-    missing = sorted(required - set(cfg))
-    if missing:
-        raise ValueError(f"model_config.json kurang field: {missing}")
+    if model_config_path.exists():
+        with model_config_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
 
-    runtime = str(cfg["runtime"]).lower()
-    mode = str(cfg["inference_mode"]).lower()
-    if runtime not in {"torchscript", "onnxruntime"}:
-        raise ValueError(f"Runtime tidak didukung: {runtime}")
-    if mode not in {"sequence", "single_frame"}:
-        raise ValueError(f"inference_mode tidak didukung: {mode}")
+        runtime = str(cfg["runtime"]).lower()
+        mode = str(cfg["inference_mode"]).lower()
+        if runtime not in {"torchscript", "onnxruntime"}:
+            raise ValueError(f"Runtime tidak didukung: {runtime}")
+        if mode not in {"sequence", "single_frame"}:
+            raise ValueError(f"inference_mode tidak didukung: {mode}")
 
-    return RuntimeSpec(
-        version=version,
-        name=str(cfg["name"]),
-        runtime=runtime,
-        inference_mode=mode,
-        model_file=str(cfg["model_file"]),
-        mean_file=str(cfg["mean_file"]),
-        std_file=str(cfg["std_file"]),
-        mapping_file=str(cfg["mapping_file"]),
-        sequence_length=int(cfg["sequence_length"]),
-        feature_dim=int(cfg["feature_dim"]),
-        num_classes=int(cfg["num_classes"]),
+        return RuntimeSpec(
+            version=version,
+            name=str(cfg["name"]),
+            runtime=runtime,
+            inference_mode=mode,
+            kind="hand134",
+            model_file=str(cfg["model_file"]),
+            mapping_file=str(cfg["mapping_file"]),
+            sequence_length=int(cfg["sequence_length"]),
+            num_classes=int(cfg["num_classes"]),
+            feature_dim=int(cfg["feature_dim"]),
+            winner_mode=None,
+        )
+
+    # Legacy fallback kept so older folders are still readable.
+    if version == "v1":
+        return RuntimeSpec(
+            version=version,
+            name="WL-BISINDO Hand134 Transformer V4",
+            runtime="torchscript",
+            inference_mode="sequence",
+            kind="hand134",
+            model_file="wl_bisindo_hand134_transformer_traced.pt",
+            mapping_file="class_mapping.json",
+            sequence_length=48,
+            num_classes=32,
+            feature_dim=134,
+        )
+    if version == "v2":
+        return RuntimeSpec(
+            version=version,
+            name="BISINDO Alphabet V8.4 Temporal Transformer",
+            runtime="torchscript",
+            inference_mode="sequence",
+            kind="hand134",
+            model_file="alphabet_temporal_v8_4_traced.pt",
+            mapping_file="class_mapping_v8_4.json",
+            sequence_length=48,
+            num_classes=26,
+            feature_dim=134,
+        )
+
+    raise FileNotFoundError(
+        f"Tidak ada deployment_config.json / model_config.json di {model_dir}"
     )
 
 
-RUNTIME_SPEC = load_runtime_spec(
-    DEFAULT_MODEL_DIR,
-    ACTIVE_MODEL_VERSION,
-)
+RUNTIME_SPEC = load_runtime_spec(DEFAULT_MODEL_DIR, ACTIVE_MODEL_VERSION)
 
 DEFAULT_MODEL_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.model_file
-DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.mean_file
-DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.std_file
 DEFAULT_MAPPING_PATH = DEFAULT_MODEL_DIR / RUNTIME_SPEC.mapping_file
 
+# Legacy hand-only stats. Multimodal uses separate branch stats.
+if RUNTIME_SPEC.kind == "hand134":
+    if (DEFAULT_MODEL_DIR / "model_config.json").exists():
+        with (DEFAULT_MODEL_DIR / "model_config.json").open("r", encoding="utf-8") as f:
+            _legacy_cfg = json.load(f)
+        DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / _legacy_cfg["mean_file"]
+        DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / _legacy_cfg["std_file"]
+    elif ACTIVE_MODEL_VERSION == "v2":
+        DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / "feature_mean_v8_4.npy"
+        DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / "feature_std_v8_4.npy"
+    else:
+        DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / "feature_mean.npy"
+        DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / "feature_std.npy"
+else:
+    DEFAULT_MEAN_PATH = DEFAULT_MODEL_DIR / "hand_mean.npy"
+    DEFAULT_STD_PATH = DEFAULT_MODEL_DIR / "hand_std.npy"
 
 # ============================================================
 # Preprocessing V2 constants — MUST match Kaggle preprocessing
@@ -211,9 +253,45 @@ RIGHT_PRESENCE_IDX = 133
 MAX_INTERP_GAP = 6
 EDGE_FILL = 2
 EMA_ALPHA = 0.65
+FACE_BOX_EMA_ALPHA = 0.65
 
 # Pose quality.
 POSE_VIS_THRESHOLD = 0.25
+POSE_FEATURE_VIS_THRESHOLD = 0.20
+FACE_POINT_VIS_THRESHOLD = 0.20
+
+POSE_SELECTED = [
+    (0, "nose"),
+    (11, "left_shoulder"),
+    (12, "right_shoulder"),
+    (13, "left_elbow"),
+    (14, "right_elbow"),
+    (15, "left_wrist"),
+    (16, "right_wrist"),
+    (23, "left_hip"),
+    (24, "right_hip"),
+]
+POSE_DIM = 36
+POSE_VIS_IDXS = [3, 7, 11, 15, 19, 23, 27, 31, 35]
+
+FACE_POSE_SELECTED = [
+    (0, "nose"),
+    (1, "left_eye_inner"),
+    (2, "left_eye"),
+    (3, "left_eye_outer"),
+    (4, "right_eye_inner"),
+    (5, "right_eye"),
+    (6, "right_eye_outer"),
+    (7, "left_ear"),
+    (8, "right_ear"),
+    (9, "mouth_left"),
+    (10, "mouth_right"),
+]
+FACEHEAD_DIM = 52
+FACE_HEAD_DIM = FACEHEAD_DIM
+FACE_VIS_IDXS = list(range(33, 44))
+FACE_PRESENCE_IDX = 51
+FACE_CROP_SIZE = 48
 
 # Hand detector.
 FULL_HAND_DET_CONF = 0.30
@@ -342,103 +420,104 @@ def load_runtime_files(
     mapping_path: Path,
     device: torch.device,
 ):
-    required = [
-        model_path,
-        mean_path,
-        std_path,
-        mapping_path,
-    ]
+    mapping = load_mapping(mapping_path)
 
+    if RUNTIME_SPEC.kind == "multimodal":
+        paths = {
+            "model": model_path,
+            "hand_mean": DEFAULT_MODEL_DIR / "hand_mean.npy",
+            "hand_std": DEFAULT_MODEL_DIR / "hand_std.npy",
+            "pose_mean": DEFAULT_MODEL_DIR / "pose_mean.npy",
+            "pose_std": DEFAULT_MODEL_DIR / "pose_std.npy",
+            "face_mean": DEFAULT_MODEL_DIR / "facehead_mean.npy",
+            "face_std": DEFAULT_MODEL_DIR / "facehead_std.npy",
+            "crop_stats": DEFAULT_MODEL_DIR / "facecrop_stats.json",
+            "mapping": mapping_path,
+        }
+        missing = [p for p in paths.values() if not p.exists()]
+        if missing:
+            lines = "\n".join(f" - {p}" for p in missing)
+            raise FileNotFoundError(
+                "File runtime multimodal belum lengkap:\n"
+                f"{lines}"
+            )
+
+        stats = {
+            "hand_mean": np.load(paths["hand_mean"]).astype(np.float32),
+            "hand_std": np.load(paths["hand_std"]).astype(np.float32),
+            "pose_mean": np.load(paths["pose_mean"]).astype(np.float32),
+            "pose_std": np.load(paths["pose_std"]).astype(np.float32),
+            "face_mean": np.load(paths["face_mean"]).astype(np.float32),
+            "face_std": np.load(paths["face_std"]).astype(np.float32),
+        }
+        with paths["crop_stats"].open("r", encoding="utf-8") as f:
+            crop_stats = json.load(f)
+        stats["crop_mean"] = float(crop_stats["mean"])
+        stats["crop_std"] = max(float(crop_stats["std"]), 1e-4)
+
+        expected = {
+            "hand_mean": (134,), "hand_std": (134,),
+            "pose_mean": (36,), "pose_std": (36,),
+            "face_mean": (52,), "face_std": (52,),
+        }
+        for key, shape in expected.items():
+            if stats[key].shape != shape:
+                raise ValueError(f"{key} harus {shape}, found {stats[key].shape}")
+            if not np.isfinite(stats[key]).all():
+                raise ValueError(f"{key} mengandung NaN/Inf")
+        for key in ["hand_std", "pose_std", "face_std"]:
+            stats[key] = np.where(stats[key] < 1e-5, 1.0, stats[key]).astype(np.float32)
+
+        if RUNTIME_SPEC.runtime != "torchscript":
+            raise ValueError("Multimodal deployment saat ini harus TorchScript")
+
+        model = torch.jit.load(str(model_path), map_location=device).eval()
+        dummy_hand = torch.zeros(1, SEQ_LEN, 134, dtype=torch.float32, device=device)
+        dummy_pose = torch.zeros(1, SEQ_LEN, 36, dtype=torch.float32, device=device)
+        dummy_face = torch.zeros(1, SEQ_LEN, 52, dtype=torch.float32, device=device)
+        dummy_crop = torch.zeros(1, SEQ_LEN, 48, 48, dtype=torch.float32, device=device)
+        with torch.inference_mode():
+            output = model(dummy_hand, dummy_pose, dummy_face, dummy_crop)
+        if tuple(output.shape) != (1, NUM_CLASSES):
+            raise RuntimeError(
+                f"Output multimodal harus (1,{NUM_CLASSES}), found {tuple(output.shape)}"
+            )
+        return model, stats, mapping
+
+    # Legacy / alphabet Hand134 single-input path.
+    required = [model_path, mean_path, std_path, mapping_path]
     missing = [p for p in required if not p.exists()]
     if missing:
         lines = "\n".join(f" - {p}" for p in missing)
-        raise FileNotFoundError(
-            "File runtime belum lengkap:\n"
-            f"{lines}\n\n"
-            "Copy hasil export Kaggle ke folder local/model/."
-        )
+        raise FileNotFoundError("File runtime belum lengkap:\n" + lines)
 
     feature_mean = np.load(mean_path).astype(np.float32)
     feature_std = np.load(std_path).astype(np.float32)
-
     if feature_mean.shape != (FEATURE_DIM,):
-        raise ValueError(
-            f"feature_mean harus ({FEATURE_DIM},), "
-            f"found {feature_mean.shape}"
-        )
-
+        raise ValueError(f"feature_mean harus ({FEATURE_DIM},), found {feature_mean.shape}")
     if feature_std.shape != (FEATURE_DIM,):
-        raise ValueError(
-            f"feature_std harus ({FEATURE_DIM},), "
-            f"found {feature_std.shape}"
-        )
-
-    feature_std = np.where(
-        feature_std < 1e-5,
-        1.0,
-        feature_std,
-    ).astype(np.float32)
-
-    mapping = load_mapping(mapping_path)
+        raise ValueError(f"feature_std harus ({FEATURE_DIM},), found {feature_std.shape}")
+    feature_std = np.where(feature_std < 1e-5, 1.0, feature_std).astype(np.float32)
 
     if RUNTIME_SPEC.runtime == "torchscript":
-        model = torch.jit.load(
-            str(model_path),
-            map_location=device,
-        ).eval()
-
-        dummy_shape = (
-            (1, SEQ_LEN, FEATURE_DIM)
-            if RUNTIME_SPEC.inference_mode == "sequence"
-            else (1, FEATURE_DIM)
-        )
-        dummy = torch.zeros(
-            *dummy_shape,
-            dtype=torch.float32,
-            device=device,
-        )
+        model = torch.jit.load(str(model_path), map_location=device).eval()
+        dummy_shape = (1, SEQ_LEN, FEATURE_DIM) if RUNTIME_SPEC.inference_mode == "sequence" else (1, FEATURE_DIM)
+        dummy = torch.zeros(*dummy_shape, dtype=torch.float32, device=device)
         with torch.inference_mode():
             output = model(dummy)
         output_shape = tuple(output.shape)
     else:
-        try:
-            import onnxruntime as ort
-        except ImportError as exc:
-            raise ImportError(
-                "Model aktif membutuhkan onnxruntime. Jalankan: "
-                "python -m pip install onnxruntime==1.20.1"
-            ) from exc
-
-        providers = ["CPUExecutionProvider"]
-        model = ort.InferenceSession(
-            str(model_path),
-            providers=providers,
-        )
+        import onnxruntime as ort
+        model = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         input_meta = model.get_inputs()[0]
-        output_meta = model.get_outputs()[0]
-        expected_rank = 3 if RUNTIME_SPEC.inference_mode == "sequence" else 2
-        if len(input_meta.shape) != expected_rank:
-            raise RuntimeError(
-                f"Rank input ONNX harus {expected_rank}, found {input_meta.shape}"
-            )
-        dummy_shape = (
-            (1, SEQ_LEN, FEATURE_DIM)
-            if RUNTIME_SPEC.inference_mode == "sequence"
-            else (1, FEATURE_DIM)
-        )
-        output = model.run(
-            [output_meta.name],
-            {input_meta.name: np.zeros(dummy_shape, dtype=np.float32)},
-        )[0]
+        dummy_shape = (1, SEQ_LEN, FEATURE_DIM) if RUNTIME_SPEC.inference_mode == "sequence" else (1, FEATURE_DIM)
+        output = model.run(None, {input_meta.name: np.zeros(dummy_shape, dtype=np.float32)})[0]
         output_shape = tuple(output.shape)
 
     if output_shape != (1, NUM_CLASSES):
-        raise RuntimeError(
-            "Output model tidak sesuai. "
-            f"Expected (1,{NUM_CLASSES}), found {output_shape}"
-        )
+        raise RuntimeError(f"Output model harus (1,{NUM_CLASSES}), found {output_shape}")
 
-    return model, feature_mean, feature_std, mapping
+    return model, {"feature_mean": feature_mean, "feature_std": feature_std}, mapping
 
 
 def landmark_list_to_array(hand_landmarks) -> np.ndarray:
@@ -520,6 +599,761 @@ def pose_anchor(pose_result):
         left_wrist,
         right_wrist,
         valid,
+    )
+
+
+def extract_selected_pose_raw(
+    pose_result,
+):
+    coords = np.full(
+        (
+            len(POSE_SELECTED),
+            3,
+        ),
+        np.nan,
+        dtype=np.float32,
+    )
+
+    valid = np.zeros(
+        len(POSE_SELECTED),
+        dtype=np.uint8,
+    )
+
+    visibility = np.zeros(
+        len(POSE_SELECTED),
+        dtype=np.float32,
+    )
+
+    if (
+        pose_result.pose_landmarks
+        is None
+    ):
+        return (
+            coords,
+            valid,
+            visibility,
+        )
+
+    lms = (
+        pose_result
+        .pose_landmarks
+        .landmark
+    )
+
+    for j, (
+        index,
+        _,
+    ) in enumerate(
+        POSE_SELECTED
+    ):
+        lm = lms[index]
+
+        vis = float(
+            np.clip(
+                lm.visibility,
+                0.0,
+                1.0,
+            )
+        )
+
+        visibility[j] = vis
+
+        if (
+            vis
+            >= POSE_FEATURE_VIS_THRESHOLD
+        ):
+            coords[j] = np.array(
+                [
+                    lm.x,
+                    lm.y,
+                    lm.z,
+                ],
+                dtype=np.float32,
+            )
+
+            valid[j] = 1
+
+    return (
+        coords,
+        valid,
+        visibility,
+    )
+
+
+def pose_to_feature(
+    pose_coords,
+    pose_valid,
+    pose_visibility,
+    body_center,
+    body_scale,
+):
+    feat = np.zeros(
+        POSE_DIM,
+        dtype=np.float32,
+    )
+
+    scale = max(
+        float(body_scale),
+        0.08,
+    )
+
+    for j in range(
+        len(POSE_SELECTED)
+    ):
+        base = j * 4
+
+        if (
+            pose_valid[j] > 0
+            and np.isfinite(
+                pose_coords[j]
+            ).all()
+        ):
+            local = (
+                pose_coords[j]
+                - body_center
+            ) / scale
+
+            feat[
+                base:base + 3
+            ] = np.clip(
+                local,
+                -10.0,
+                10.0,
+            )
+
+            feat[
+                base + 3
+            ] = float(
+                np.clip(
+                    pose_visibility[j],
+                    0.0,
+                    1.0,
+                )
+            )
+
+    return feat
+
+
+def extract_face_pose_raw(
+    pose_result,
+):
+    coords = np.full(
+        (
+            len(
+                FACE_POSE_SELECTED
+            ),
+            3,
+        ),
+        np.nan,
+        dtype=np.float32,
+    )
+
+    visibility = np.zeros(
+        len(
+            FACE_POSE_SELECTED
+        ),
+        dtype=np.float32,
+    )
+
+    valid = np.zeros(
+        len(
+            FACE_POSE_SELECTED
+        ),
+        dtype=np.uint8,
+    )
+
+    if (
+        pose_result.pose_landmarks
+        is None
+    ):
+        return (
+            coords,
+            visibility,
+            valid,
+        )
+
+    lms = (
+        pose_result
+        .pose_landmarks
+        .landmark
+    )
+
+    for j, (
+        index,
+        _,
+    ) in enumerate(
+        FACE_POSE_SELECTED
+    ):
+        lm = lms[index]
+
+        vis = float(
+            np.clip(
+                lm.visibility,
+                0.0,
+                1.0,
+            )
+        )
+
+        visibility[j] = vis
+
+        if (
+            vis
+            >= FACE_POINT_VIS_THRESHOLD
+        ):
+            coords[j] = np.array(
+                [
+                    lm.x,
+                    lm.y,
+                    lm.z,
+                ],
+                dtype=np.float32,
+            )
+
+            valid[j] = 1
+
+    return (
+        coords,
+        visibility,
+        valid,
+    )
+
+
+def safe_distance(
+    coords,
+    valid,
+    a,
+    b,
+):
+    if (
+        valid[a] > 0
+        and valid[b] > 0
+        and np.isfinite(
+            coords[a]
+        ).all()
+        and np.isfinite(
+            coords[b]
+        ).all()
+    ):
+        return float(
+            np.linalg.norm(
+                coords[
+                    a,
+                    :2,
+                ]
+                - coords[
+                    b,
+                    :2,
+                ]
+            )
+        )
+
+    return 0.0
+
+
+def facehead_to_feature(
+    coords,
+    visibility,
+    valid,
+    body_center,
+    body_scale,
+):
+    feat = np.zeros(
+        FACE_HEAD_DIM,
+        dtype=np.float32,
+    )
+
+    # Need at least a small face constellation.
+    num_valid = int(
+        valid.sum()
+    )
+
+    if num_valid < 3:
+        return (
+            feat,
+            0,
+        )
+
+    # Array positions:
+    # 0 nose
+    # 2 left eye center
+    # 5 right eye center
+    # 7 left ear
+    # 8 right ear
+    # 9 mouth left
+    # 10 mouth right
+
+    if (
+        valid[2] > 0
+        and valid[5] > 0
+    ):
+        face_center = (
+            coords[2]
+            + coords[5]
+        ) / 2.0
+
+    elif (
+        valid[0] > 0
+    ):
+        face_center = (
+            coords[0]
+            .copy()
+        )
+
+    else:
+        valid_points = (
+            coords[
+                valid > 0
+            ]
+        )
+
+        face_center = np.mean(
+            valid_points,
+            axis=0,
+        )
+
+    ear_distance = safe_distance(
+        coords,
+        valid,
+        7,
+        8,
+    )
+
+    eye_distance = safe_distance(
+        coords,
+        valid,
+        2,
+        5,
+    )
+
+    face_scale = max(
+        ear_distance,
+        eye_distance,
+        float(body_scale)
+        * 0.35,
+        0.04,
+    )
+
+    # 11 xyz = 33
+    for j in range(
+        len(
+            FACE_POSE_SELECTED
+        )
+    ):
+        if (
+            valid[j] > 0
+            and np.isfinite(
+                coords[j]
+            ).all()
+        ):
+            local = (
+                coords[j]
+                - face_center
+            ) / face_scale
+
+            start = (
+                j * 3
+            )
+
+            feat[
+                start:start + 3
+            ] = np.clip(
+                local,
+                -6.0,
+                6.0,
+            )
+
+    # 11 visibility = 11 -> indices 33:44
+    feat[
+        33:44
+    ] = np.where(
+        valid > 0,
+        np.clip(
+            visibility,
+            0.0,
+            1.0,
+        ),
+        0.0,
+    ).astype(
+        np.float32
+    )
+
+    mouth_width = safe_distance(
+        coords,
+        valid,
+        9,
+        10,
+    )
+
+    # Eye-line orientation.
+    eye_sin = 0.0
+    eye_cos = 0.0
+
+    if (
+        valid[2] > 0
+        and valid[5] > 0
+    ):
+        delta = (
+            coords[
+                5,
+                :2,
+            ]
+            - coords[
+                2,
+                :2,
+            ]
+        )
+
+        norm = float(
+            np.linalg.norm(
+                delta
+            )
+        )
+
+        if norm > 1e-6:
+            eye_cos = float(
+                delta[0]
+                / norm
+            )
+
+            eye_sin = float(
+                delta[1]
+                / norm
+            )
+
+    # Nose location relative to body.
+    nose_body_x = 0.0
+    nose_body_y = 0.0
+
+    if (
+        valid[0] > 0
+        and np.isfinite(
+            coords[0]
+        ).all()
+    ):
+        nose_body = (
+            coords[0]
+            - body_center
+        ) / max(
+            float(body_scale),
+            0.08,
+        )
+
+        nose_body_x = float(
+            np.clip(
+                nose_body[0],
+                -10.0,
+                10.0,
+            )
+        )
+
+        nose_body_y = float(
+            np.clip(
+                nose_body[1],
+                -10.0,
+                10.0,
+            )
+        )
+
+    # 7 geometry/global -> 44:51
+    feat[
+        44:51
+    ] = np.asarray(
+        [
+            eye_distance
+            / face_scale,
+            ear_distance
+            / face_scale,
+            mouth_width
+            / face_scale,
+            eye_sin,
+            eye_cos,
+            nose_body_x,
+            nose_body_y,
+        ],
+        dtype=np.float32,
+    )
+
+    # Presence -> index 51
+    feat[51] = 1.0
+
+    return (
+        feat,
+        1,
+    )
+
+
+def face_bbox_from_pose(
+    coords,
+    valid,
+    frame_shape,
+    body_scale,
+):
+    h, w = frame_shape[:2]
+
+    valid_xy = (
+        coords[
+            valid > 0,
+            :2,
+        ]
+    )
+
+    if len(valid_xy) < 3:
+        return None
+
+    x_min = float(
+        np.min(
+            valid_xy[:, 0]
+        )
+    )
+
+    x_max = float(
+        np.max(
+            valid_xy[:, 0]
+        )
+    )
+
+    y_min = float(
+        np.min(
+            valid_xy[:, 1]
+        )
+    )
+
+    y_max = float(
+        np.max(
+            valid_xy[:, 1]
+        )
+    )
+
+    cx = (
+        x_min
+        + x_max
+    ) / 2.0
+
+    cy = (
+        y_min
+        + y_max
+    ) / 2.0
+
+    raw_w = max(
+        x_max - x_min,
+        float(body_scale)
+        * 0.45,
+        0.06,
+    )
+
+    raw_h = max(
+        y_max - y_min,
+        float(body_scale)
+        * 0.55,
+        0.08,
+    )
+
+    # Include forehead/chin area beyond sparse pose face points.
+    side = max(
+        raw_w * 1.80,
+        raw_h * 2.00,
+    )
+
+    side = float(
+        np.clip(
+            side,
+            0.10,
+            0.55,
+        )
+    )
+
+    # Shift slightly upward because pose mouth/nose points make
+    # the raw center a little low.
+    cy = (
+        cy
+        - 0.10
+        * side
+    )
+
+    x0 = int(
+        np.clip(
+            (
+                cx
+                - side / 2.0
+            )
+            * w,
+            0,
+            w - 1,
+        )
+    )
+
+    y0 = int(
+        np.clip(
+            (
+                cy
+                - side / 2.0
+            )
+            * h,
+            0,
+            h - 1,
+        )
+    )
+
+    x1 = int(
+        np.clip(
+            (
+                cx
+                + side / 2.0
+            )
+            * w,
+            1,
+            w,
+        )
+    )
+
+    y1 = int(
+        np.clip(
+            (
+                cy
+                + side / 2.0
+            )
+            * h,
+            1,
+            h,
+        )
+    )
+
+    if (
+        x1 - x0 < 12
+        or y1 - y0 < 12
+    ):
+        return None
+
+    return np.asarray(
+        [
+            x0,
+            y0,
+            x1,
+            y1,
+        ],
+        dtype=np.float32,
+    )
+
+
+def smooth_bbox(
+    bbox,
+    prev_bbox,
+    alpha=FACE_BOX_EMA_ALPHA,
+):
+    if bbox is None:
+        return prev_bbox
+
+    if prev_bbox is None:
+        return bbox.copy()
+
+    return (
+        alpha
+        * bbox
+        + (
+            1.0
+            - alpha
+        )
+        * prev_bbox
+    ).astype(
+        np.float32
+    )
+
+
+def crop_face_gray(
+    frame,
+    bbox,
+):
+    if bbox is None:
+        return (
+            np.zeros(
+                (
+                    FACE_CROP_SIZE,
+                    FACE_CROP_SIZE,
+                ),
+                dtype=np.uint8,
+            ),
+            0,
+        )
+
+    h, w = (
+        frame.shape[:2]
+    )
+
+    x0, y0, x1, y1 = [
+        int(
+            round(v)
+        )
+        for v in bbox
+    ]
+
+    x0 = int(
+        np.clip(
+            x0,
+            0,
+            w - 1,
+        )
+    )
+
+    y0 = int(
+        np.clip(
+            y0,
+            0,
+            h - 1,
+        )
+    )
+
+    x1 = int(
+        np.clip(
+            x1,
+            x0 + 1,
+            w,
+        )
+    )
+
+    y1 = int(
+        np.clip(
+            y1,
+            y0 + 1,
+            h,
+        )
+    )
+
+    crop = frame[
+        y0:y1,
+        x0:x1,
+    ]
+
+    if crop.size == 0:
+        return (
+            np.zeros(
+                (
+                    FACE_CROP_SIZE,
+                    FACE_CROP_SIZE,
+                ),
+                dtype=np.uint8,
+            ),
+            0,
+        )
+
+    gray = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    resized = cv2.resize(
+        gray,
+        (
+            FACE_CROP_SIZE,
+            FACE_CROP_SIZE,
+        ),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    return (
+        resized.astype(
+            np.uint8
+        ),
+        1,
     )
 
 
@@ -1090,23 +1924,23 @@ def hand_to_feature(
 
 @dataclass
 class FrameState:
-    tracks: np.ndarray       # [2,21,3], NaN for missing
-    observed: np.ndarray     # [2]
-    body_center: np.ndarray  # [3]
+    tracks: np.ndarray              # [2,21,3], NaN for missing
+    observed: np.ndarray            # [2]
+    body_center: np.ndarray         # [3]
     body_scale: float
     pose_valid: int
+    pose_coords: np.ndarray         # [9,3]
+    pose_point_valid: np.ndarray    # [9]
+    pose_visibility: np.ndarray     # [9]
+    face_coords: np.ndarray         # [11,3]
+    face_visibility: np.ndarray     # [11]
+    face_point_valid: np.ndarray    # [11]
+    face_crop: np.ndarray           # [48,48] uint8
+    face_crop_valid: int
 
 
-def build_hand134_sequence(
-    states,
-    feature_mean,
-    feature_std,
-):
-    if len(states) < SEQ_LEN:
-        return None, None
-
-    states = list(states)[-SEQ_LEN:]
-
+def _recover_hand_tracks(states):
+    """Apply the same short-gap interpolation + EMA as preprocessing."""
     tracks = np.stack(
         [s.tracks for s in states],
         axis=0,
@@ -1116,6 +1950,83 @@ def build_hand134_sequence(
         [s.observed for s in states],
         axis=0,
     ).astype(np.uint8)
+
+    final_valid = np.zeros(
+        (SEQ_LEN, NUM_HANDS),
+        dtype=np.uint8,
+    )
+
+    for side in [LEFT, RIGHT]:
+        track, valid_mask = interpolate_short_gaps(
+            tracks[:, side]
+        )
+        track = ema_smooth_track(
+            track,
+            valid_mask,
+        )
+        tracks[:, side] = track
+        final_valid[:, side] = valid_mask.astype(np.uint8)
+
+    return tracks, observed, final_valid
+
+
+def normalize_hand_branch(sequence, mean, std):
+    left_presence = sequence[:, LEFT_PRESENCE_IDX].copy()
+    right_presence = sequence[:, RIGHT_PRESENCE_IDX].copy()
+
+    x = (sequence - mean) / std
+
+    left_absent = left_presence < 0.5
+    right_absent = right_presence < 0.5
+
+    x[left_absent, 0:66] = 0.0
+    x[right_absent, 67:133] = 0.0
+    x[:, LEFT_PRESENCE_IDX] = left_presence
+    x[:, RIGHT_PRESENCE_IDX] = right_presence
+
+    return x.astype(np.float32)
+
+
+def normalize_pose_branch(sequence, mean, std):
+    vis = sequence[:, POSE_VIS_IDXS].copy()
+    x = (sequence - mean) / std
+
+    for j, vis_idx in enumerate(POSE_VIS_IDXS):
+        base = j * 4
+        absent = vis[:, j] < 0.2
+        x[absent, base:base + 3] = 0.0
+        x[:, vis_idx] = vis[:, j]
+
+    return x.astype(np.float32)
+
+
+def normalize_facehead_branch(sequence, mean, std):
+    vis = sequence[:, 33:44].copy()
+    presence = sequence[:, FACE_PRESENCE_IDX].copy()
+    x = (sequence - mean) / std
+
+    for j in range(11):
+        base = j * 3
+        absent = vis[:, j] < 0.2
+        x[absent, base:base + 3] = 0.0
+
+    x[:, 33:44] = vis
+    x[:, FACE_PRESENCE_IDX] = presence
+
+    face_absent = presence < 0.5
+    x[face_absent, 0:33] = 0.0
+    x[face_absent, 44:51] = 0.0
+
+    return x.astype(np.float32)
+
+
+def build_hand134_sequence(states, feature_mean, feature_std):
+    if len(states) < SEQ_LEN:
+        return None, None
+
+    states = list(states)[-SEQ_LEN:]
+
+    tracks, observed, final_valid = _recover_hand_tracks(states)
 
     body_centers = np.stack(
         [s.body_center for s in states],
@@ -1132,51 +2043,14 @@ def build_hand134_sequence(
         dtype=np.uint8,
     )
 
-    (
-        body_centers,
-        body_scales,
-    ) = fill_pose_anchors(
+    body_centers, body_scales = fill_pose_anchors(
         body_centers,
         body_scales,
         pose_valid,
     )
 
-    final_valid = np.zeros(
-        (
-            SEQ_LEN,
-            NUM_HANDS,
-        ),
-        dtype=np.uint8,
-    )
-
-    for side in [LEFT, RIGHT]:
-        track = tracks[:, side]
-
-        (
-            track,
-            valid_mask,
-        ) = interpolate_short_gaps(
-            track
-        )
-
-        track = ema_smooth_track(
-            track,
-            valid_mask,
-        )
-
-        tracks[:, side] = track
-
-        final_valid[:, side] = (
-            valid_mask.astype(
-                np.uint8
-            )
-        )
-
     sequence = np.zeros(
-        (
-            SEQ_LEN,
-            FEATURE_DIM,
-        ),
+        (SEQ_LEN, 134),
         dtype=np.float32,
     )
 
@@ -1185,95 +2059,156 @@ def build_hand134_sequence(
             tracks[t, LEFT],
             body_centers[t],
             body_scales[t],
-            bool(
-                final_valid[t, LEFT]
-            ),
+            bool(final_valid[t, LEFT]),
         )
-
         right_feat = hand_to_feature(
             tracks[t, RIGHT],
             body_centers[t],
             body_scales[t],
-            bool(
-                final_valid[t, RIGHT]
-            ),
+            bool(final_valid[t, RIGHT]),
         )
-
         sequence[t] = np.concatenate(
-            [
-                left_feat,
-                right_feat,
-            ]
+            [left_feat, right_feat]
         ).astype(np.float32)
 
-    # EXACT runtime normalization logic used by final training.
-    left_presence = sequence[
-        :,
-        LEFT_PRESENCE_IDX,
-    ].copy()
-
-    right_presence = sequence[
-        :,
-        RIGHT_PRESENCE_IDX,
-    ].copy()
-
-    x = (
-        sequence - feature_mean
-    ) / feature_std
-
-    left_absent = (
-        left_presence < 0.5
-    )
-    right_absent = (
-        right_presence < 0.5
-    )
-
-    x[
-        left_absent,
-        0:66,
-    ] = 0.0
-
-    x[
-        right_absent,
-        67:133,
-    ] = 0.0
-
-    x[
-        :,
-        LEFT_PRESENCE_IDX,
-    ] = left_presence
-
-    x[
-        :,
-        RIGHT_PRESENCE_IDX,
-    ] = right_presence
-
-    x = x.astype(
-        np.float32
+    x = normalize_hand_branch(
+        sequence,
+        feature_mean,
+        feature_std,
     )
 
     quality = {
-        "observed_any": float(
-            (
-                observed.sum(axis=1)
-                > 0
-            ).mean()
-        ),
-        "valid_any": float(
-            (
-                final_valid.sum(axis=1)
-                > 0
-            ).mean()
-        ),
-        "left_valid": float(
-            final_valid[:, LEFT].mean()
-        ),
-        "right_valid": float(
-            final_valid[:, RIGHT].mean()
-        ),
+        "observed_any": float((observed.sum(axis=1) > 0).mean()),
+        "valid_any": float((final_valid.sum(axis=1) > 0).mean()),
+        "left_valid": float(final_valid[:, LEFT].mean()),
+        "right_valid": float(final_valid[:, RIGHT].mean()),
+        "pose_valid": float(pose_valid.mean()),
+        "face_valid": 0.0,
+        "face_crop_valid": 0.0,
     }
 
     return x, quality
+
+
+def build_multimodal_inputs(states, stats):
+    """Build exact runtime inputs for the winning multimodal model.
+
+    Returns a 4-input tuple because the traced model keeps the common
+    A/B/C/D forward signature even when winner C does not use FaceCropCNN.
+    """
+    if len(states) < SEQ_LEN:
+        return None, None
+
+    states = list(states)[-SEQ_LEN:]
+
+    tracks, observed, final_valid = _recover_hand_tracks(states)
+
+    body_centers = np.stack(
+        [s.body_center for s in states],
+        axis=0,
+    ).astype(np.float32)
+    body_scales = np.asarray(
+        [s.body_scale for s in states],
+        dtype=np.float32,
+    )
+    pose_frame_valid = np.asarray(
+        [s.pose_valid for s in states],
+        dtype=np.uint8,
+    )
+
+    body_centers, body_scales = fill_pose_anchors(
+        body_centers,
+        body_scales,
+        pose_frame_valid,
+    )
+
+    hand_sequence = np.zeros((SEQ_LEN, 134), dtype=np.float32)
+    pose_sequence = np.zeros((SEQ_LEN, POSE_DIM), dtype=np.float32)
+    face_sequence = np.zeros((SEQ_LEN, FACEHEAD_DIM), dtype=np.float32)
+    facehead_valid = np.zeros(SEQ_LEN, dtype=np.uint8)
+    face_crop_valid = np.asarray(
+        [s.face_crop_valid for s in states],
+        dtype=np.uint8,
+    )
+    face_crops = np.stack(
+        [s.face_crop for s in states],
+        axis=0,
+    ).astype(np.float32)
+
+    for t, state in enumerate(states):
+        left_feat = hand_to_feature(
+            tracks[t, LEFT],
+            body_centers[t],
+            body_scales[t],
+            bool(final_valid[t, LEFT]),
+        )
+        right_feat = hand_to_feature(
+            tracks[t, RIGHT],
+            body_centers[t],
+            body_scales[t],
+            bool(final_valid[t, RIGHT]),
+        )
+        hand_sequence[t] = np.concatenate(
+            [left_feat, right_feat]
+        ).astype(np.float32)
+
+        pose_sequence[t] = pose_to_feature(
+            state.pose_coords,
+            state.pose_point_valid,
+            state.pose_visibility,
+            body_centers[t],
+            body_scales[t],
+        )
+
+        face_feat, face_ok = facehead_to_feature(
+            state.face_coords,
+            state.face_visibility,
+            state.face_point_valid,
+            body_centers[t],
+            body_scales[t],
+        )
+        face_sequence[t] = face_feat
+        facehead_valid[t] = int(face_ok)
+
+    hand_x = normalize_hand_branch(
+        hand_sequence,
+        stats["hand_mean"],
+        stats["hand_std"],
+    )
+    pose_x = normalize_pose_branch(
+        pose_sequence,
+        stats["pose_mean"],
+        stats["pose_std"],
+    )
+    face_x = normalize_facehead_branch(
+        face_sequence,
+        stats["face_mean"],
+        stats["face_std"],
+    )
+
+    crop_x = face_crops / 255.0
+    crop_x = (
+        crop_x - stats["crop_mean"]
+    ) / stats["crop_std"]
+    crop_x[face_crop_valid < 0.5] = 0.0
+    crop_x = crop_x.astype(np.float32)
+
+    quality = {
+        "observed_any": float((observed.sum(axis=1) > 0).mean()),
+        "valid_any": float((final_valid.sum(axis=1) > 0).mean()),
+        "left_valid": float(final_valid[:, LEFT].mean()),
+        "right_valid": float(final_valid[:, RIGHT].mean()),
+        "pose_valid": float(pose_frame_valid.mean()),
+        "face_valid": float(facehead_valid.mean()),
+        "face_crop_valid": float(face_crop_valid.mean()),
+    }
+
+    return (
+        hand_x,
+        pose_x,
+        face_x,
+        crop_x,
+    ), quality
 
 
 def assign_candidates_for_static_model(candidates):
@@ -1367,12 +2302,24 @@ def build_static_hand134(candidates, feature_mean, feature_std):
 
 def predict_sequence(
     model,
-    sequence,
+    model_input,
     device,
 ):
-    if RUNTIME_SPEC.runtime == "torchscript":
+    if RUNTIME_SPEC.kind == "multimodal":
+        hand_x, pose_x, face_x, crop_x = model_input
+        tensors = [
+            torch.from_numpy(hand_x).unsqueeze(0).to(device, non_blocking=True),
+            torch.from_numpy(pose_x).unsqueeze(0).to(device, non_blocking=True),
+            torch.from_numpy(face_x).unsqueeze(0).to(device, non_blocking=True),
+            torch.from_numpy(crop_x).unsqueeze(0).to(device, non_blocking=True),
+        ]
+        with torch.inference_mode():
+            logits = model(*tensors)
+            probs_np = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
+    elif RUNTIME_SPEC.runtime == "torchscript":
         x = torch.from_numpy(
-            sequence
+            model_input
         ).unsqueeze(0).to(
             device,
             non_blocking=True,
@@ -1380,11 +2327,12 @@ def predict_sequence(
         with torch.inference_mode():
             logits = model(x)
             probs_np = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
     else:
         input_meta = model.get_inputs()[0]
         logits_np = model.run(
             None,
-            {input_meta.name: sequence[None, ...].astype(np.float32)},
+            {input_meta.name: model_input[None, ...].astype(np.float32)},
         )[0][0]
         shifted = logits_np - np.max(logits_np)
         exp_values = np.exp(shifted)
@@ -1394,38 +2342,15 @@ def predict_sequence(
         np.asarray(probs_np, dtype=np.float32)
     )
 
-    top_k = min(
-        2,
-        probs.numel(),
-    )
+    top_k = min(2, probs.numel())
+    values, indices = torch.topk(probs, k=top_k)
 
-    values, indices = torch.topk(
-        probs,
-        k=top_k,
-    )
+    pred_id = int(indices[0].item())
+    confidence = float(values[0].item())
+    second = float(values[1].item()) if top_k > 1 else 0.0
+    margin = confidence - second
 
-    pred_id = int(
-        indices[0].item()
-    )
-    confidence = float(
-        values[0].item()
-    )
-
-    second = (
-        float(values[1].item())
-        if top_k > 1
-        else 0.0
-    )
-
-    margin = (
-        confidence - second
-    )
-
-    return (
-        pred_id,
-        confidence,
-        margin,
-    )
+    return pred_id, confidence, margin
 
 
 # ============================================================
@@ -1772,25 +2697,12 @@ def run(args):
         force_cpu=args.cpu
     )
 
-    model_path = Path(
-        args.model
-    )
-    mean_path = Path(
-        args.mean
-    )
-    std_path = Path(
-        args.std
-    )
-    mapping_path = Path(
-        args.mapping
-    )
+    model_path = Path(args.model)
+    mean_path = Path(args.mean)
+    std_path = Path(args.std)
+    mapping_path = Path(args.mapping)
 
-    (
-        model,
-        feature_mean,
-        feature_std,
-        labels,
-    ) = load_runtime_files(
+    model, runtime_data, labels = load_runtime_files(
         model_path,
         mean_path,
         std_path,
@@ -1799,41 +2711,36 @@ def run(args):
     )
 
     print("=" * 72)
-    print(
-        f"{RUNTIME_SPEC.name} — FAST CONTINUOUS"
-    )
+    print(f"{RUNTIME_SPEC.name} — FAST CONTINUOUS")
     print("=" * 72)
-    print(
-        "Active model   :",
-        ACTIVE_MODEL_VERSION,
-    )
-    print(
-        "Model folder   :",
-        DEFAULT_MODEL_DIR,
-    )
+    print("Active model   :", ACTIVE_MODEL_VERSION)
+    print("Model folder   :", DEFAULT_MODEL_DIR)
     print(
         "Device         :",
         device if RUNTIME_SPEC.runtime == "torchscript" else "onnxruntime-cpu",
     )
     print("Runtime        :", RUNTIME_SPEC.runtime)
     print("Inference mode :", RUNTIME_SPEC.inference_mode)
+    print("Model kind     :", RUNTIME_SPEC.kind)
+    if RUNTIME_SPEC.winner_mode is not None:
+        print("Winner mode    :", RUNTIME_SPEC.winner_mode)
 
     if device.type == "cuda":
-        print(
-            "GPU            :",
-            torch.cuda.get_device_name(
-                0
-            ),
-        )
+        print("GPU            :", torch.cuda.get_device_name(0))
 
-    print(
-        "Input model    :",
-        (
+    if RUNTIME_SPEC.kind == "multimodal":
+        print("Input model    : 4 inputs")
+        print("  hand         : 1 x 48 x 134")
+        print("  pose         : 1 x 48 x 36")
+        print("  facehead     : 1 x 48 x 52")
+        print("  facecrop     : 1 x 48 x 48 x 48")
+    else:
+        print(
+            "Input model    :",
             f"{SEQ_LEN} x {FEATURE_DIM}"
             if RUNTIME_SPEC.inference_mode == "sequence"
-            else f"{FEATURE_DIM} (single frame)"
-        ),
-    )
+            else f"{FEATURE_DIM} (single frame)",
+        )
     print(
         "Threshold      :",
         args.threshold,
@@ -1947,6 +2854,7 @@ def run(args):
 
     prev_left_wrist = None
     prev_right_wrist = None
+    prev_face_bbox = None
 
     frame_id = 0
 
@@ -2086,6 +2994,30 @@ def run(args):
                     pvalid,
                 ) = pose_anchor(
                     pose_result
+                )
+
+                pose_coords, pose_point_valid, pose_visibility = (
+                    extract_selected_pose_raw(pose_result)
+                )
+
+                face_coords, face_visibility, face_point_valid = (
+                    extract_face_pose_raw(pose_result)
+                )
+
+                current_face_bbox = face_bbox_from_pose(
+                    face_coords,
+                    face_point_valid,
+                    frame.shape,
+                    body_scale,
+                )
+                if current_face_bbox is not None:
+                    prev_face_bbox = smooth_bbox(
+                        current_face_bbox,
+                        prev_face_bbox,
+                    )
+                face_crop, face_crop_ok = crop_face_gray(
+                    frame,
+                    prev_face_bbox,
                 )
 
                 primary_candidates = (
@@ -2251,12 +3183,16 @@ def run(args):
                         tracks=tracks,
                         observed=observed,
                         body_center=body_center,
-                        body_scale=float(
-                            body_scale
-                        ),
-                        pose_valid=int(
-                            pvalid > 0.5
-                        ),
+                        body_scale=float(body_scale),
+                        pose_valid=int(pvalid > 0.5),
+                        pose_coords=pose_coords,
+                        pose_point_valid=pose_point_valid,
+                        pose_visibility=pose_visibility,
+                        face_coords=face_coords,
+                        face_visibility=face_visibility,
+                        face_point_valid=face_point_valid,
+                        face_crop=face_crop,
+                        face_crop_valid=int(face_crop_ok),
                     )
                 )
 
@@ -2271,17 +3207,22 @@ def run(args):
                 )
 
                 if can_infer:
-                    if RUNTIME_SPEC.inference_mode == "single_frame":
-                        sequence, quality = build_static_hand134(
+                    if RUNTIME_SPEC.kind == "multimodal":
+                        model_input, quality = build_multimodal_inputs(
+                            raw_window,
+                            runtime_data,
+                        )
+                    elif RUNTIME_SPEC.inference_mode == "single_frame":
+                        model_input, quality = build_static_hand134(
                             candidates,
-                            feature_mean,
-                            feature_std,
+                            runtime_data["feature_mean"],
+                            runtime_data["feature_std"],
                         )
                     else:
-                        sequence, quality = build_hand134_sequence(
+                        model_input, quality = build_hand134_sequence(
                             raw_window,
-                            feature_mean,
-                            feature_std,
+                            runtime_data["feature_mean"],
+                            runtime_data["feature_std"],
                         )
 
                     (
@@ -2290,7 +3231,7 @@ def run(args):
                         margin,
                     ) = predict_sequence(
                         model,
-                        sequence,
+                        model_input,
                         device,
                     )
 
@@ -2722,6 +3663,7 @@ def run(args):
                     prediction_history.clear()
                     prev_left_wrist = None
                     prev_right_wrist = None
+                    prev_face_bbox = None
                     last_emit_label = None
                     last_emit_time = 0.0
                     same_label_rearmed = True

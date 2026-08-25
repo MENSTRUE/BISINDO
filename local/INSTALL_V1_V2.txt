@@ -1,32 +1,87 @@
-WL-BISINDO DYNAMIC MODEL SELECTOR — UPDATED V8.4
-================================================
+WL-BISINDO DYNAMIC MODEL SELECTOR — MULTIMODAL V1 + ALPHABET V2
+================================================================
 
-1. models/v1 = model perkata (TorchScript sequence 48x134, 32 kelas)
-2. models/v2 = alphabet V8.4 (TorchScript sequence 48x134, 26 kelas A-Z)
+ACTIVE MODEL
+------------
+active_model.txt = v1  -> NEW word model: Multimodal Hand + Pose + FaceHead
+active_model.txt = v2  -> Alphabet V8.4 Hand134 temporal model
 
-models/v2 wajib berisi:
-- alphabet_temporal_v8_4_traced.pt
-- feature_mean_v8_4.npy
-- feature_std_v8_4.npy
-- class_mapping_v8_4.json
-- model_config.json
-- recommended_realtime_v8_4.json
-- metrics_v8_4.json (opsional runtime)
 
-Pilih model melalui active_model.txt:
-- v1 = kata
-- v2 = alphabet V8.4
+models/v1 — NEW MULTIMODAL WORD MODEL
+-------------------------------------
+JANGAN rename file hasil Kaggle. Folder v1 yang benar:
 
-Untuk alphabet sekarang isi active_model.txt:
-v2
+models/v1/
+  class_mapping.json
+  deployment_config.json
+  facecrop_stats.json
+  facehead_mean.npy
+  facehead_std.npy
+  hand_mean.npy
+  hand_std.npy
+  pose_mean.npy
+  pose_std.npy
+  wl_bisindo_multimodal_traced.pt
 
-Jalankan:
-.\run.bat
+NOTE:
+- Tidak membutuhkan feature_mean.npy / feature_std.npy.
+- Tidak membutuhkan wl_bisindo_hand134_transformer_traced.pt.
+- check_setup.py baru otomatis membaca deployment_config.json.
+- Winner training adalah mode C = Hand134 + Pose36 + FaceHead52.
+- TorchScript tetap mempunyai signature 4 input; facecrop dikirim juga,
+  walaupun winner C tidak memakai CNN face crop di cabang klasifikasi.
 
-Startup v2 yang benar:
-Runtime        : torchscript
-Inference mode : sequence
-Expected input : 1 x 48 x 134
-Expected output: 1 x 26
+Expected v1 runtime:
+  runtime      : torchscript
+  kind         : multimodal
+  hand input   : 1 x 48 x 134
+  pose input   : 1 x 48 x 36
+  facehead     : 1 x 48 x 52
+  facecrop     : 1 x 48 x 48 x 48
+  output       : 1 x 32
 
-V7 ONNX single-frame SUDAH BUKAN deployment alphabet utama.
+
+models/v2 — ALPHABET V8.4
+-------------------------
+Tetap seperti sebelumnya:
+
+models/v2/
+  alphabet_temporal_v8_4_traced.pt
+  feature_mean_v8_4.npy
+  feature_std_v8_4.npy
+  class_mapping_v8_4.json
+  model_config.json
+  recommended_realtime_v8_4.json
+  metrics_v8_4.json   (opsional runtime)
+
+Expected v2:
+  input  : 1 x 48 x 134
+  output : 1 x 26
+
+
+CARA PASANG UPDATE
+------------------
+1. Tutup aplikasi realtime.
+2. Copy/replace file update ini ke folder local:
+     realtime_bisindo.py
+     check_setup.py
+     run.bat
+     setup_env.bat
+     requirements.txt
+     active_model.txt
+3. JANGAN hapus models/v1 kamu. Isi model pada screenshot sudah benar.
+4. Pastikan active_model.txt berisi:
+     v1
+5. Jalankan:
+     .\run.bat
+
+Startup v1 yang benar akan menampilkan:
+  Model kind     : multimodal
+  Winner mode    : C
+  Expected inputs:
+    hand       : 1 x 48 x 134
+    pose       : 1 x 48 x 36
+    facehead   : 1 x 48 x 52
+    facecrop   : 1 x 48 x 48 x 48
+  Expected output: 1 x 32
+
