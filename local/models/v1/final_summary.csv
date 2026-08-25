@@ -1,7 +1,0 @@
-Metric,Value
-Best Development Epoch,18.0
-Best Development Macro-F1,0.9493
-Final Test Accuracy,0.8656
-Final Test Macro-F1,0.8573
-Zero-F1 Classes,0.0
-Test Signer,4.0

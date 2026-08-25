@@ -1,13 +1,40 @@
 {
-  "model": "DualHandTemporalTransformer",
-  "seq_len": 48,
-  "feature_dim": 134,
+  "name": "WL-BISINDO Multimodal Temporal Transformer",
+  "runtime": "torchscript",
+  "model_file": "wl_bisindo_multimodal_traced.pt",
+  "winner_mode": "C",
+  "winner_name": "Hand134 + Pose36 + FaceHead52",
+  "sequence_length": 48,
   "num_classes": 32,
+  "inputs": {
+    "hand": [
+      1,
+      48,
+      134
+    ],
+    "pose": [
+      1,
+      48,
+      36
+    ],
+    "facehead": [
+      1,
+      48,
+      52
+    ],
+    "facecrop": [
+      1,
+      48,
+      48,
+      48
+    ]
+  },
+  "best_epoch": 50,
+  "best_dev_accuracy": 0.9595238095238096,
+  "best_dev_macro_f1": 0.9549616649428987,
+  "final_test_accuracy": 0.878125,
+  "final_test_macro_f1": 0.8710839130170256,
   "test_signer": 4,
-  "development_split_mode": "leave-one-development-signer-out",
-  "development_validation_signer": 1,
-  "best_epoch": 18,
-  "test_accuracy": 0.865625,
-  "test_macro_f1": 0.85725311145085,
+  "dev_val_signer": 1,
   "zero_f1_classes": []
 }
